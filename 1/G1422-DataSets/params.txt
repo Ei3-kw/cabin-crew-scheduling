@@ -1,0 +1,19 @@
+instances
+../instances/FINAL/NW_727-csv
+../instances/FINAL/NW_757-csv
+../instances/FINAL/NW_D94-csv
+../instances/FINAL/NW_D95-csv
+../instances/FINAL/NW_DC9-csv
+../instances/FINAL/NW_319-csv
+../instances/FINAL/NW_320-csv
+
+preferredVacations.cpp
+% employees choosen : 30
+
+EmployeeLegPreferences.cpp
+% airleg choosen : 10
+
+credit_constrains.cpp
+% to main base : 90 85 75 70 65 60 50
+% slack : 3
+
