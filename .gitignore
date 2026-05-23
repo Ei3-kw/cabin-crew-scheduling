@@ -3,3 +3,5 @@ data/flights_enriched.csv
 data/T_ONTIME_MARKETING.csv
 data/flights_enriched copy.csv
 talk/talk.mov
+*.pkl
+*.pkl
