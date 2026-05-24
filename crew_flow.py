@@ -36,7 +36,7 @@ Key advantages over individual-variable formulation:
   - Same optimality guarantees; same result file format
 
 Data:
-  - flights_enriched_copy.csv (BTS On-Time + FAA registry join)
+  - flights_enriched.csv (BTS On-Time + FAA registry join)
   - Uses first 3 days, all airports as bases
 """
 
@@ -51,13 +51,12 @@ import gurobipy as gp
 from gurobipy import GRB
 
 # ─────────────────────────────────────────────
-# CONFIGURATION  (identical to crew_ddd.py)
+# CONFIGURATION
 # ─────────────────────────────────────────────
-DAYS_TO_SOLVE      = 3
+DAYS_TO_SOLVE      = 4
 RETURN_WINDOW      = 7
-RANDOM_SEED        = 42
+RANDOM_SEED        = 42069
 MIN_CREW_PER_BASE  = 5
-MAX_CREW_PER_BASE  = 40
 TIME_BUCKET        = 15
 MIN_TURNAROUND     = 45
 MIN_REST           = 8 * 60
@@ -69,7 +68,7 @@ COST_LAYOVER_MIN   = 0.5
 COST_OVERNIGHT     = 500.0
 COST_UNCOVERED     = 1e7
 
-MAX_DUTY_MINUTES   = 14 * 60
+MAX_DUTY_MINUTES   = 20 * 60
 MAX_DUTY_DAYS      = 5
 
 FARE_BASE          = 50.0
@@ -82,7 +81,7 @@ LARGE              = int(1e9)
 
 
 # ─────────────────────────────────────────────
-# DATA STRUCTURES  (unchanged from crew_ddd.py)
+# DATA STRUCTURES
 # ─────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -133,7 +132,7 @@ class Arc:
 
 
 # ─────────────────────────────────────────────
-# CSV PARSING  (unchanged)
+# CSV PARSING
 # ─────────────────────────────────────────────
 
 def parse_hhmm(s: str) -> int:
@@ -226,7 +225,7 @@ def parse_flights(filepath: str, days: int, horizon_days: int | None = None) -> 
 
 
 # ─────────────────────────────────────────────
-# CREW BASE ASSIGNMENT  (unchanged)
+# CREW BASE ASSIGNMENT
 # ─────────────────────────────────────────────
 
 def assign_crew_bases(flights: list[Flight], seed: int = RANDOM_SEED) -> list[CrewMember]:
@@ -265,7 +264,7 @@ def assign_crew_bases(flights: list[Flight], seed: int = RANDOM_SEED) -> list[Cr
 
 
 # ─────────────────────────────────────────────
-# COST HELPERS  (unchanged)
+# COST HELPERS
 # ─────────────────────────────────────────────
 
 def estimated_fare(distance_miles: float) -> float:
@@ -472,6 +471,72 @@ class CrewFlowNetwork:
         self.wait_arc_by_start[from_node] = arc
         return arc
 
+    # ── Reachability ──────────────────────────
+
+    def compute_reachable_arcs(self) -> dict[str, set[int]]:
+        """
+        For each base, find arcs reachable from its depot via forward BFS.
+
+        Uses scipy.sparse.csgraph.breadth_first_order which runs BFS in compiled
+        C rather than Python, giving ~100x speedup over pure-Python BFS loops.
+
+        Steps:
+          1. Map all nodes to integer IDs, build a CSR adjacency matrix.
+          2. For each base depot, call breadth_first_order to get all reachable
+             node IDs in O(N + E) time (C speed).
+          3. Mark arcs whose start node is in the reachable set.
+
+        Returns: dict mapping base -> set of reachable arc IDs
+        """
+        import time as _t
+        import numpy as np
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import breadth_first_order
+
+        t0 = _t.time()
+        print(f"  Computing reachability per base (scipy BFS)...", end="", flush=True)
+
+        # Integer-index all nodes
+        node_list = list(self.nodes)
+        node_idx  = {n: i for i, n in enumerate(node_list)}
+        N = len(node_list)
+
+        # Build CSR: one entry per arc  (row=end node, col=start node)
+        arc_list      = list(self.arcs)
+        arc_ids       = np.array([a.id    for a in arc_list], dtype=np.int32)
+        arc_start_idx = np.array([node_idx[a.start] for a in arc_list], dtype=np.int32)
+        arc_end_idx   = np.array([node_idx[a.end]   for a in arc_list], dtype=np.int32)
+
+        data = np.ones(len(arc_list), dtype=np.float32)
+        # G[i,j] = 1 means directed edge from node i to node j
+        G = csr_matrix((data, (arc_start_idx, arc_end_idx)), shape=(N, N))
+
+        reachable: dict[str, set[int]] = {}
+
+        for base in self.airports:
+            depot = Node(airport=base, time=DEPOT_TIME_START)
+            if depot not in node_idx:
+                reachable[base] = set()
+                continue
+
+            # breadth_first_order returns array of node indices visited from depot
+            visited = breadth_first_order(
+                G, i_start=node_idx[depot],
+                directed=True, return_predecessors=False
+            )
+
+            # An arc is reachable if its start node was visited
+            mask = np.isin(arc_start_idx, visited)
+            reachable[base] = set(arc_ids[mask].tolist())
+
+        total_pairs = sum(len(v) for v in reachable.values())
+        full_pairs  = len(self.airports) * len(self.arcs)
+        pct = 100.0 * total_pairs / full_pairs if full_pairs else 0
+        print(f" done ({_t.time()-t0:.1f}s)")
+        print(f"  Reachable (base,arc) pairs: {total_pairs:,} / {full_pairs:,} "
+              f"= {pct:.1f}% of full cross-product")
+        return reachable
+
     def _build_flight_index(self):
         self._flights_from: dict[str, list[Flight]] = defaultdict(list)
         self._flights_to:   dict[str, list[Flight]] = defaultdict(list)
@@ -544,18 +609,15 @@ class CrewFlowNetwork:
             if duty_after < existing:
                 self.min_duty_at[arr_node] = duty_after
 
-            dh_cost = deadhead_cost(f, load_factor=None)
             self._make_arc(dep_node, arr_node, f.arr_min,
                            f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
-            self._make_arc(dep_node, arr_node, f.arr_min,
-                           dh_cost, 'deadhead', f.id)
-            n_arcs += 2
+            n_arcs += 1
 
         if n_missing:
             print(f"  WARNING: {n_missing} flights have no connectable arc!")
         if n_pruned_duty:
             print(f"  Duty-pruned: {n_pruned_duty} flights exceeded MAX_DUTY_MINUTES")
-        print(f"  Flight/deadhead arcs: {n_arcs} ({n_arcs//2} flights)  ({_t.time()-t0:.1f}s)")
+        print(f"  Flight arcs: {n_arcs}  ({_t.time()-t0:.1f}s)")
         print(f"  Initial network: {len(self.nodes)} nodes, {len(self.arcs)} arcs  "
               f"(total {_t.time()-t0:.1f}s)")
 
@@ -617,10 +679,8 @@ class CrewFlowNetwork:
             existing_duty = self.min_duty_at.get(arr_node, MAX_DUTY_MINUTES + 1)
             if duty_after < existing_duty:
                 self.min_duty_at[arr_node] = duty_after
-            dh_cost = deadhead_cost(f)
             self._make_arc(node, arr_node, f.arr_min,
                            f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
-            self._make_arc(node, arr_node, f.arr_min, dh_cost, 'deadhead', f.id)
 
     def _create_flight_arcs_to(self, node: Node):
         for f in self.flights:
@@ -636,10 +696,8 @@ class CrewFlowNetwork:
             existing_duty = self.min_duty_at.get(node, MAX_DUTY_MINUTES + 1)
             if duty_after < existing_duty:
                 self.min_duty_at[node] = duty_after
-            dh_cost = deadhead_cost(f)
             self._make_arc(dep_node, node, f.arr_min,
                            f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
-            self._make_arc(dep_node, node, f.arr_min, dh_cost, 'deadhead', f.id)
 
     # ── Gurobi model ──────────────────────────
 
@@ -665,24 +723,27 @@ class CrewFlowNetwork:
         print(f"  Building flow model: {n_arcs} arcs, {n_nodes} nodes, "
               f"{len(self.airports)} bases  ({_t.time()-t0:.1f}s)")
 
-        # ── Per-base flow variables ───────────────────────────────────────
-        # One set of (work, dh, wait) variables per BASE per arc.
-        # O(|bases| × |arcs|) — dramatically smaller than O(|crew| × |arcs|)
-        # because |bases| is typically 4-20 while |crew| can be hundreds.
+        # ── Reachability pruning ──────────────────────────────────────────
+        # Only create (base, arc) variables for arcs physically reachable
+        # from that base's depot. Reduces variables from O(|bases|×|arcs|)
+        # to O(reachable pairs) — typically 5-15% of the full cross-product.
+        arc_id_to_arc = {arc.id: arc for arc in arc_list}
+        reachable = self.compute_reachable_arcs()  # base -> set of arc IDs
+
+        # ── Per-base flow variables (reachable pairs only) ────────────────
         for base in self.airports:
+            reachable_ids = reachable[base]
             for arc in arc_list:
+                if arc.id not in reachable_ids:
+                    continue
                 if arc.arc_type == 'flight':
+                    f_obj = self.flights_by_id.get(arc.flight_id)
+                    dh_c  = deadhead_cost(f_obj) if f_obj else arc.cost
                     self.var_work[(base, arc)] = self.model.addVar(
                         lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
                         name=f"fw_{base}_{arc.id}")
-                    f_obj = self.flights_by_id.get(arc.flight_id)
-                    dh_c  = deadhead_cost(f_obj) if f_obj else arc.cost
                     self.var_dh[(base, arc)] = self.model.addVar(
                         lb=0, obj=dh_c, vtype=GRB.CONTINUOUS,
-                        name=f"fd_{base}_{arc.id}")
-                elif arc.arc_type == 'deadhead':
-                    self.var_dh[(base, arc)] = self.model.addVar(
-                        lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
                         name=f"fd_{base}_{arc.id}")
                 elif arc.arc_type == 'wait':
                     self.var_wait[(base, arc)] = self.model.addVar(
@@ -843,18 +904,8 @@ class CrewFlowNetwork:
                     self.model.chgCoeff(node_constrs[arc.start], var, 1)
                 if arc.end in node_constrs:
                     self.model.chgCoeff(node_constrs[arc.end], var, -1)
-            # Wire work var into coverage
             if arc.flight_id in self.coverage_constrs:
                 self.model.chgCoeff(self.coverage_constrs[arc.flight_id], wk, 1)
-
-        elif arc.arc_type == 'deadhead':
-            dh = self.model.addVar(lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
-                                   name=f"fd_{base}_{arc.id}")
-            self.var_dh[(base, arc)] = dh
-            if arc.start in node_constrs:
-                self.model.chgCoeff(node_constrs[arc.start], dh, 1)
-            if arc.end in node_constrs:
-                self.model.chgCoeff(node_constrs[arc.end], dh, -1)
 
         elif arc.arc_type == 'wait':
             wt = self.model.addVar(lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
@@ -1194,7 +1245,7 @@ class CrewFlowNetwork:
 
 
 # ─────────────────────────────────────────────
-# RESULT SERIALISATION  (identical to crew_ddd.py)
+# RESULT SERIALISATION
 # ─────────────────────────────────────────────
 
 def save_result(result: dict, net: CrewFlowNetwork, out_path: str = "crew_result.json"):

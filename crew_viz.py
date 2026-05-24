@@ -52,38 +52,91 @@ import sys
 import os
 
 AIRPORT_POSITIONS = {
-    # Roughly geographic layout for a 860×540 canvas.
+    # Roughly geographic layout for a 1100×700 canvas.
     # Keys are IATA codes. Add/override here for other networks.
-    "JFK": (690, 148),
-    "LAX": (105, 228),
-    "ORD": (418, 112),
-    "MIA": (615, 398),
-    "SFO": (80,  200),
-    "DFW": (380, 310),
-    "ATL": (560, 310),
-    "BOS": (720, 120),
-    "SEA": (90,  110),
-    "DEN": (280, 210),
-    "LAS": (155, 260),
-    "PHX": (200, 300),
+    "JFK": (890, 190),
+    "LAX": (130, 295),
+    "ORD": (530, 145),
+    "MIA": (790, 515),
+    "SFO": (100, 260),
+    "DFW": (485, 400),
+    "ATL": (720, 400),
+    "BOS": (930, 155),
+    "SEA": (115, 140),
+    "DEN": (355, 270),
+    "LAS": (195, 335),
+    "PHX": (255, 390),
 }
 
-DEFAULT_POSITION_RADIUS = 240   # fallback circle radius for unknown airports
-DEFAULT_CENTER = (430, 270)
+DEFAULT_POSITION_RADIUS = 290   # fallback circle radius for unknown airports
+DEFAULT_CENTER = (550, 350)
+
+# Canvas margins / safe zone for auto-placed nodes
+_CANVAS_W, _CANVAS_H = 1100, 700
+_MARGIN = 60          # stay this far from canvas edge
+_MIN_DIST = 90        # minimum distance between any two nodes
 
 
 def auto_position(codes):
-    """Place unknown airports evenly around a circle."""
-    import math
-    known = {c: AIRPORT_POSITIONS[c] for c in codes if c in AIRPORT_POSITIONS}
+    """
+    Place unknown airports on the canvas.
+    - Airports in AIRPORT_POSITIONS keep their coordinates.
+    - Unknown airports are placed on expanding concentric rings so they
+      don't stack up on a single circle when there are many of them.
+    - A simple repulsion pass then nudges nodes apart if they're still
+      too close together.
+    """
+    import math, random
+    random.seed(42)
+
+    known = {c: list(AIRPORT_POSITIONS[c]) for c in codes if c in AIRPORT_POSITIONS}
     unknown = [c for c in codes if c not in AIRPORT_POSITIONS]
     n = len(unknown)
+
+    if n == 0:
+        return {k: tuple(v) for k, v in known.items()}
+
+    # Place unknowns on concentric rings: 6 per ring, expanding outward
+    per_ring = 6
+    base_r   = 160
+    r_step   = 80
+    placed   = []
     for i, code in enumerate(unknown):
-        angle = 2 * math.pi * i / max(n, 1) - math.pi / 2
-        x = DEFAULT_CENTER[0] + DEFAULT_POSITION_RADIUS * math.cos(angle)
-        y = DEFAULT_CENTER[1] + DEFAULT_POSITION_RADIUS * math.sin(angle)
-        known[code] = (round(x), round(y))
-    return known
+        ring  = i // per_ring
+        slot  = i %  per_ring
+        total_in_ring = min(per_ring, n - ring * per_ring)
+        r     = base_r + ring * r_step
+        angle = 2 * math.pi * slot / max(total_in_ring, 1) - math.pi / 2
+        cx, cy = DEFAULT_CENTER
+        x = cx + r * math.cos(angle)
+        y = cy + r * math.sin(angle)
+        # clamp to canvas safe zone
+        x = max(_MARGIN, min(_CANVAS_W - _MARGIN, x))
+        y = max(_MARGIN, min(_CANVAS_H - _MARGIN, y))
+        known[code] = [x, y]
+        placed.append(code)
+
+    # Repulsion: push nodes apart if too close (50 iterations)
+    all_codes = list(known.keys())
+    for _ in range(50):
+        for i, a in enumerate(all_codes):
+            for b in all_codes[i+1:]:
+                pa, pb = known[a], known[b]
+                dx = pa[0] - pb[0]
+                dy = pa[1] - pb[1]
+                dist = math.sqrt(dx*dx + dy*dy) or 0.01
+                if dist < _MIN_DIST:
+                    push = (_MIN_DIST - dist) / 2 + 1
+                    nx, ny = dx/dist * push, dy/dist * push
+                    # only move unknowns, leave known airports fixed
+                    if a not in AIRPORT_POSITIONS:
+                        known[a][0] = max(_MARGIN, min(_CANVAS_W - _MARGIN, pa[0] + nx))
+                        known[a][1] = max(_MARGIN, min(_CANVAS_H - _MARGIN, pa[1] + ny))
+                    if b not in AIRPORT_POSITIONS:
+                        known[b][0] = max(_MARGIN, min(_CANVAS_W - _MARGIN, pb[0] - nx))
+                        known[b][1] = max(_MARGIN, min(_CANVAS_H - _MARGIN, pb[1] - ny))
+
+    return {k: (round(v[0]), round(v[1])) for k, v in known.items()}
 
 
 def build_html(data: dict) -> str:
@@ -123,7 +176,7 @@ h1{{font-size:16px;font-weight:500;margin-bottom:12px;color:#1a1a1a}}
 #filters label{{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}}
 .sw{{display:inline-block;width:20px;height:3px;border-radius:2px;vertical-align:middle}}
 #svg-wrap{{position:relative;border:0.5px solid #ddd;border-radius:10px;background:#fff}}
-#nsvg{{display:block;width:100%;max-height:560px}}
+#nsvg{{display:block;width:100%;max-height:720px}}
 #tip{{position:absolute;background:#fff;border:0.5px solid #bbb;border-radius:8px;
   padding:9px 13px;font-size:12px;pointer-events:none;opacity:0;
   transition:opacity .12s;max-width:240px;line-height:1.7;z-index:20;
@@ -161,9 +214,13 @@ h1{{font-size:16px;font-weight:500;margin-bottom:12px;color:#1a1a1a}}
   <input type="range" id="scrubber" min="0" max="{horizon}" step="10" value="0">
   <span id="tdisp">Day 1  00:00</span>
   <span id="airborne"></span>
+  <span id="portfocus" style="display:none;font-size:12px;background:#185FA5;color:#fff;
+    padding:3px 10px;border-radius:12px;cursor:pointer" title="Click to clear filter">
+    ✕ <span id="portfocuslabel"></span>
+  </span>
 </div>
 <div id="svg-wrap">
-  <svg id="nsvg" viewBox="0 0 860 540" xmlns="http://www.w3.org/2000/svg"></svg>
+  <svg id="nsvg" viewBox="0 0 1100 700" xmlns="http://www.w3.org/2000/svg"></svg>
   <div id="tip"></div>
 </div>
 <div id="legend">
@@ -243,9 +300,15 @@ function flightStatus(f) {{
 }}
 
 const flightCrewCount = {{}};
+const flightDeadheadCrew = {{}};  // flight_id → [crew_ids riding as DH]
 RAW.routes.forEach(r => r.legs.forEach(l => {{
-  if (l.type === 'flight')
+  if (l.type === 'flight') {{
     flightCrewCount[l.flight_id] = (flightCrewCount[l.flight_id] || 0) + 1;
+  }} else if (l.type === 'deadhead') {{
+    if (!flightDeadheadCrew[l.flight_id]) flightDeadheadCrew[l.flight_id] = [];
+    if (!flightDeadheadCrew[l.flight_id].includes(r.crew_id))
+      flightDeadheadCrew[l.flight_id].push(r.crew_id);
+  }}
 }}));
 
 const crewBase = {{}};
@@ -419,24 +482,42 @@ function crewAtAirportsAt(t) {{
 }}
 
 // ── arc bend assignment ───────────────────────────────────────────────────────
+// Each undirected pair (A,B) gets its arcs fanned perpendicularly to the chord.
+// • 1 arc  → modest fixed bend so the label clears node circles.
+// • N arcs → symmetric fan; step scales with edge length, capped to stay on screen.
+// • B→A arcs always go to the opposite side from A→B, so they never overlap.
 
-function assignBends(arcs) {{
-  const pairCount = {{}}, pairIdx = {{}};
+function assignBends(arcs, apRef) {{
+  const groups = {{}};
   arcs.forEach(a => {{
-    const k = [a.from, a.to].sort().join('-');
-    pairCount[k] = (pairCount[k] || 0) + 1;
+    const k = [a.from, a.to].sort().join('|');
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(a);
   }});
-  return arcs.map(a => {{
-    const k   = [a.from, a.to].sort().join('-');
-    pairIdx[k] = (pairIdx[k] || 0);
-    const idx  = pairIdx[k]++;
-    const n    = pairCount[k];
-    const spread = n === 1 ? 0 : (idx - (n - 1) / 2) * 28;
-    const fwd  = a.from < a.to;
-    const base = 54;
-    const bend = n === 1 ? base : (base + Math.abs(spread)) * (fwd ? 1 : -1) * (spread < 0 ? -1 : 1);
-    return {{ ...a, bend }};
+
+  const result = [];
+  Object.values(groups).forEach(grp => {{
+    const n = grp.length;
+    if (n === 1) {{ result.push({{ ...grp[0], bend: 48 }}); return; }}
+
+    const A = apRef && apRef[grp[0].from];
+    const B = apRef && apRef[grp[0].to];
+    const edgeLen = (A && B) ? Math.sqrt((B.x-A.x)**2+(B.y-A.y)**2) : 200;
+    const step  = Math.min(40, Math.max(22, edgeLen * 0.09));
+    const halfW = step * (n - 1) / 2;
+
+    const sorted = grp.slice().sort((x, y) => {{
+      const kx = x.from + '|' + x.to, ky = y.from + '|' + y.to;
+      return kx < ky ? -1 : kx > ky ? 1 : 0;
+    }});
+    sorted.forEach((arc, i) => {{
+      const offset   = -halfW + i * step;
+      const canonical = [arc.from, arc.to].sort().join('|');
+      const fwd      = (arc.from + '|' + arc.to) === canonical;
+      result.push({{ ...arc, bend: fwd ? offset : -offset }});
+    }});
   }});
+  return result;
 }}
 
 // ── SVG defs (arrow markers) ─────────────────────────────────────────────────
@@ -474,6 +555,7 @@ function buildFlightTip(arc, isActive, t) {{
   const uf = RAW.uncovered_flights.find(u => u.flight_num === f.flight_num);
   const prog = isActive ? Math.round((t - f.dep_min) / (f.arr_min - f.dep_min) * 100) : null;
   const assigned = flightCrewCount[f.id] || 0;
+  const dhCrew   = flightDeadheadCrew[f.id] || [];
   const colMap = {{ covered:'#1D9E75', partial:'#EF9F27', uncovered:'#E24B4A' }};
   const lblMap = {{ covered:'Fully covered', partial:'Partially covered', uncovered:'Uncovered' }};
   const col    = colMap[arc.status];
@@ -484,6 +566,7 @@ function buildFlightTip(arc, isActive, t) {{
     + '<s2>Duration: ' + f.duration + ' min</s2>'
     + '<s2>Min crew: ' + f.min_crew + ' · Assigned: ' + assigned
     + (uf ? ' · Missing: ' + uf.missing_slots : '') + '</s2>'
+    + (dhCrew.length ? '<s2 style="color:#7F77DD">✈ Deadheading: Crew ' + dhCrew.join(', ') + '</s2>' : '')
     + (prog !== null ? '<s2 style="color:' + col + '">Airborne — ' + prog + '% complete</s2>' : '');
 }}
 
@@ -535,6 +618,18 @@ function buildApTip(code, apData, total, t) {{
     + (detailRows ? '<s2 style="margin-top:4px;display:block;border-top:0.5px solid #ddd;padding-top:4px">Ground crew status:</s2>' + detailRows : '');
 }}
 
+// ── port focus state ─────────────────────────────────────────────────────────
+// selectedPorts is a Set of 0, 1, or 2 airport codes.
+// - 0: no filter
+// - 1: show all arcs touching that port, spread neighbours radially
+// - 2: show ONLY arcs directly between the two ports, using real positions
+
+let selectedPorts = new Set();
+
+function getOverrideAP() {{
+  return AP;
+}}
+
 // ── main render ───────────────────────────────────────────────────────────────
 
 function render() {{
@@ -546,6 +641,23 @@ function render() {{
   const showU      = document.getElementById('fu').checked;
   const showDH     = document.getElementById('fd').checked;
   const activeOnly = document.getElementById('fa').checked;
+
+  const ports  = [...selectedPorts];
+  const apNow  = getOverrideAP();
+  const pairMode = ports.length === 2;
+
+  // update focus badge
+  const badge    = document.getElementById('portfocus');
+  const badgeLbl = document.getElementById('portfocuslabel');
+  if (ports.length === 0) {{
+    badge.style.display = 'none';
+  }} else if (ports.length === 1) {{
+    badge.style.display = '';
+    badgeLbl.textContent = ports[0] + ' flights';
+  }} else {{
+    badge.style.display = '';
+    badgeLbl.textContent = ports[0] + ' ↔ ' + ports[1] + ' only';
+  }}
 
   // use the richer availability data (superset of crewAtAirportsAt)
   const avail  = crewAvailabilityAt(t);
@@ -569,7 +681,15 @@ function render() {{
     if (!dhMap[k].crewIds.includes(r.crew_id)) dhMap[k].crewIds.push(r.crew_id);
   }}));
 
-  const bent = assignBends(allArcs);
+  // In pair mode filter BEFORE bend assignment so the fan only covers the
+  // relevant arcs and their bends are nicely spaced.
+  const visibleArcs = pairMode
+    ? allArcs.filter(a =>
+        (a.from === ports[0] && a.to === ports[1]) ||
+        (a.from === ports[1] && a.to === ports[0]))
+    : allArcs;
+
+  const bent = assignBends(visibleArcs, apNow);
   const arcLayer = el('g');
 
   bent.forEach(arc => {{
@@ -586,8 +706,13 @@ function render() {{
       : (t >= arc.flight.dep_min && t < arc.flight.arr_min);
     if (activeOnly && !isActive) return;
 
-    const A = AP[arc.from], B = AP[arc.to];
+    const A = apNow[arc.from], B = apNow[arc.to];
     if (!A || !B) return;
+
+    // in single-port mode: dim arcs unrelated to selected ports
+    const relatedToFocus = ports.length === 0
+      || arc.from === ports[0] || arc.to === ports[0]
+      || (ports[1] && (arc.from === ports[1] || arc.to === ports[1]));
 
     const colMap  = {{ covered:'#1D9E75', partial:'#EF9F27', uncovered:'#E24B4A' }};
     const markMap = {{ covered:'ac',       partial:'ap',       uncovered:'au' }};
@@ -597,7 +722,8 @@ function render() {{
 
     const {{ cx, cy, d }} = arcPath(A.x, A.y, B.x, B.y, arc.bend || 54);
     const sw = isActive ? 2.5 : 1.3;
-    const op = isActive ? 0.95 : 0.22;
+    const baseOp = isActive ? 0.95 : 0.22;
+    const op = relatedToFocus ? baseOp : baseOp * 0.25;
 
     const g = el('g'); g.style.cursor = 'pointer';
 
@@ -633,7 +759,8 @@ function render() {{
 
   // airport nodes
   const nodeLayer = el('g');
-  Object.entries(AP).forEach(([code, pos]) => {{
+  Object.entries(AP).forEach(([code, _origPos]) => {{
+    const pos    = apNow[code] || _origPos;
     const apData   = avail[code] || null;
     const cnt      = crewNow[code] || 0;
     const total    = baseTotal[code] || 0;
@@ -642,6 +769,13 @@ function render() {{
     const availCnt = apData ? apData.available : 0;
     const onBreak  = cnt - availCnt;
     const g        = el('g'); g.style.cursor = 'pointer';
+
+    // selection ring colour: blue for first pick, orange for second
+    if (selectedPorts.has(code)) {{
+      const ringCol = ports.indexOf(code) === 0 ? '#185FA5' : '#EF9F27';
+      g.appendChild(el('circle', {{ cx:pos.x, cy:pos.y, r:34, fill:'none',
+        stroke:ringCol, 'stroke-width':'2.5', 'stroke-dasharray':'4 3', 'stroke-opacity':'0.8' }}));
+    }}
 
     g.appendChild(el('circle', {{ cx:pos.x, cy:pos.y, r:28, fill:'#185FA5',
       'fill-opacity':'0.12', stroke:'#185FA5', 'stroke-width':'1.5', 'stroke-opacity':'0.55' }}));
@@ -699,6 +833,18 @@ function render() {{
     g.addEventListener('mouseenter', e => {{ tip.innerHTML = buildApTip(code, apData, total, t); tip.classList.add('on'); moveTip(e); }});
     g.addEventListener('mousemove',  moveTip);
     g.addEventListener('mouseleave', () => tip.classList.remove('on'));
+    g.addEventListener('click', () => {{
+      if (selectedPorts.has(code)) {{
+        selectedPorts.delete(code);
+      }} else if (selectedPorts.size < 2) {{
+        selectedPorts.add(code);
+      }} else {{
+        // already have 2 — replace the second (most recently added)
+        const arr = [...selectedPorts];
+        selectedPorts = new Set([arr[0], code]);
+      }}
+      render();
+    }});
     nodeLayer.appendChild(g);
   }});
   svg.appendChild(nodeLayer);
@@ -737,6 +883,13 @@ render();
 document.getElementById('scrubber').addEventListener('input', render);
 ['fc','fp','fu','fd','fa'].forEach(id =>
   document.getElementById(id).addEventListener('change', render));
+document.getElementById('portfocus').addEventListener('click', () => {{
+  selectedPorts = new Set(); render();
+}});
+// click on SVG background to deselect
+svg.addEventListener('click', e => {{
+  if (e.target === svg || e.target.tagName === 'svg') {{ selectedPorts = new Set(); render(); }}
+}});
 </script>
 </body>
 </html>
