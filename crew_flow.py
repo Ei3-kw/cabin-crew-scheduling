@@ -1,6 +1,6 @@
 """
-Cabin Crew Pairing via Integer Flow + DDD
-==========================================
+Cabin Crew Pairing via Integer Flow
+=====================================
 Solves the minimum-cost crew pairing problem for US domestic flights.
 
 Problem:
@@ -11,7 +11,7 @@ Problem:
   - Minimise: flight-hour costs + deadhead costs + layover costs
 
 Method:
-  - Build a time-expanded network: nodes = (airport, time_bucket)
+  - Build a time-expanded network: nodes = (airport, exact_flight_time)
   - Arcs: flight | deadhead | wait
   - Variables: integer FLOW per arc (not per crew member)
       f_work[arc] = # crew working this arc
@@ -21,8 +21,7 @@ Method:
                            demand = crew_count[base] at horizon
   - Coverage: f_work[flight_arc] >= flight.min_crew
   - Deadhead = surplus flow above min_crew (priced separately)
-  - Solve LP relaxation → check violations → refine → repeat (DDD)
-  - Once LP converges, solve as MIP (integer flows)
+  - Solve directly as MIP (no DDD needed — network already uses exact flight times)
 
 Stage 2 (roster assignment):
   - After solving, decompose flows into individual crew routes
@@ -54,10 +53,11 @@ from sortedcontainers import SortedList
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-DAYS_TO_SOLVE      = 1
+DAYS_TO_SOLVE      = 3
 RETURN_WINDOW      = 7
 RANDOM_SEED        = 42069
 MIN_CREW_PER_BASE  = 5
+MAX_BASES          = 69       # top airports by departure volume; None = all airports
 TIME_BUCKET        = 15
 MIN_TURNAROUND     = 45
 MIN_REST           = 8 * 60
@@ -229,13 +229,29 @@ def parse_flights(filepath: str, days: int, horizon_days: int | None = None) -> 
 # CREW BASE ASSIGNMENT
 # ─────────────────────────────────────────────
 
-def assign_crew_bases(flights: list[Flight], seed: int = RANDOM_SEED) -> list[CrewMember]:
+def assign_crew_bases(flights: list[Flight], seed: int = RANDOM_SEED,
+                      max_bases: int | None = MAX_BASES) -> list[CrewMember]:
     rng = random.Random(seed)
-    airports = sorted(set(f.origin for f in flights) | set(f.dest for f in flights))
+    all_airports = sorted(set(f.origin for f in flights) | set(f.dest for f in flights))
 
     demand_minutes: dict[str, float] = defaultdict(float)
+    dep_count: dict[str, int] = defaultdict(int)
     for f in flights:
         demand_minutes[f.origin] += f.min_crew * f.duration
+        dep_count[f.origin] += 1
+
+    # Select bases: top airports by departure count, capped at max_bases.
+    if max_bases is not None and len(all_airports) > max_bases:
+        airports = sorted(
+            all_airports,
+            key=lambda ap: dep_count.get(ap, 0),
+            reverse=True
+        )[:max_bases]
+        airports = sorted(airports)   # restore alphabetical order for determinism
+        print(f"  Selected {len(airports)} bases from {len(all_airports)} airports "
+              f"(top by departure volume)")
+    else:
+        airports = all_airports
 
     horizon_days = max(f.arr_min for f in flights) / 1440 if flights else 3
     duty_minutes_per_crew = 480 * horizon_days
@@ -298,8 +314,6 @@ def _sorted_node_list():
     return SortedList(key=_node_time_key)
 
 # Module-level globals populated by the process-pool initializer.
-# Each worker process receives the graph once via the initializer,
-# so individual task args are just (fwd_start_id, bwd_start_id) — tiny to pickle.
 _WORKER_FWD_GRAPH: dict = {}
 _WORKER_BWD_GRAPH: dict = {}
 _WORKER_HORIZON:   int  = 0
@@ -319,11 +333,6 @@ def _dijkstra_worker(args: tuple) -> tuple[set[int], set[int]]:
 
     args: (fwd_start_id, bwd_start_id)
     Returns (fwd_reachable_arc_ids, bwd_reachable_arc_ids).
-
-    Both graphs live in module-level globals set by _worker_init — sent once
-    per worker process, NOT re-pickled for every task.  Task args are just two
-    integers, eliminating the O(|arcs|) serialisation that caused the 48s→140s
-    regression when the graph was passed per-call.
     """
     import heapq
     fwd_start, bwd_start = args
@@ -355,7 +364,11 @@ def _dijkstra_worker(args: tuple) -> tuple[set[int], set[int]]:
 class CrewFlowNetwork:
 
     """
-    Time-expanded network for cabin crew pairing via integer flow + DDD.
+    Time-expanded network for cabin crew pairing via integer flow.
+
+    The network uses exact flight departure/arrival times as node timestamps,
+    so no iterative time refinement (DDD) is needed — the network is already
+    fully discretised at build time.
 
     Variables (per arc, not per crew member):
       f_work[arc] ∈ ℤ≥0   number of working crew on this arc
@@ -367,14 +380,9 @@ class CrewFlowNetwork:
       ∑_{a out of n} flow[a]  ==  ∑_{a into n} flow[a]
       ... with supply = crew_count[b] injected at (b, t=0)
               demand = crew_count[b] absorbed at (b, t=horizon)
-      Flow from other bases is blocked at their depot nodes.
 
     Coverage:
       f_work[flight_arc] + slack[flt] >= flt.min_crew
-
-    Deadhead:
-      f_dh[arc] >= 0   (priced at deadhead cost, not flight cost)
-      Total flow on a flight arc = f_work + f_dh
 
     After solving, Stage 2 flow decomposition assigns named crew IDs.
     """
@@ -393,7 +401,6 @@ class CrewFlowNetwork:
         self.crew = crew
         self.crew_by_id = {c.id: c for c in crew}
 
-        # crew count per base
         self.base_crew: dict[str, int] = defaultdict(int)
         for c in crew:
             self.base_crew[c.base] += 1
@@ -410,7 +417,7 @@ class CrewFlowNetwork:
             _sorted_node_list)
         self.arcs:              set[Arc]                        = set()
         self._arc_counter       = 0
-        self._arc_key_set:      set[tuple]                      = set()   # dedup
+        self._arc_key_set:      set[tuple]                      = set()
         self.arcs_from:         dict[Node, list[Arc]]           = defaultdict(list)
         self.arcs_to:           dict[Node, list[Arc]]           = defaultdict(list)
         self.wait_arc_by_start: dict[Node, Arc]                 = {}
@@ -421,17 +428,14 @@ class CrewFlowNetwork:
         self.model: gp.Model | None = None
 
         # Flow variables: (base, arc) -> Var
-        # Keyed per base so flow balance can be enforced independently per base.
-        # O(|bases| × |arcs|) — much smaller than O(|crew| × |arcs|) because
-        # |bases| << |crew| (typically 4-20 bases vs hundreds of crew members).
-        self.var_work: dict[tuple[str, Arc], gp.Var] = {}   # working crew
-        self.var_dh:   dict[tuple[str, Arc], gp.Var] = {}   # deadheading crew
-        self.var_wait: dict[tuple[str, Arc], gp.Var] = {}   # waiting crew
-        self.slack_var: dict[int, gp.Var] = {}               # coverage slack per flight
+        self.var_work:  dict[tuple[str, Arc], gp.Var] = {}
+        self.var_dh:    dict[tuple[str, Arc], gp.Var] = {}
+        self.var_wait:  dict[tuple[str, Arc], gp.Var] = {}
+        self.slack_var: dict[int, gp.Var] = {}
 
         # Constraints
-        self.flow_constrs:     dict[str, dict[Node, gp.Constr]] = {}  # base -> node -> constr
-        self.coverage_constrs: dict[int, gp.Constr] = {}              # flight_id -> constr
+        self.flow_constrs:     dict[str, dict[Node, gp.Constr]] = {}
+        self.coverage_constrs: dict[int, gp.Constr] = {}
 
     # ── Pickle compatibility ──────────────────
     CACHE_VERSION = 1
@@ -467,7 +471,6 @@ class CrewFlowNetwork:
                     new_nba[ap].add(n)
             self.nodes_by_airport = new_nba
 
-        # Rebuild arc dedup set from existing arcs
         if not self._arc_key_set and self.arcs:
             self._arc_key_set = {
                 (a.start, a.end, a.arc_type, a.flight_id) for a in self.arcs
@@ -486,7 +489,6 @@ class CrewFlowNetwork:
         if not nodes:
             return None
         if round_down:
-            # bisect_key_right gives first index > time; step back one
             idx = nodes.bisect_key_right(time) - 1
             return nodes[idx] if idx >= 0 else None
         else:
@@ -506,7 +508,6 @@ class CrewFlowNetwork:
                   cost: float, arc_type: str, flight_id: int | None = None) -> Arc:
         key = (start, end, arc_type, flight_id)
         if key in self._arc_key_set:
-            # Return the existing arc (scan is now just the dedup set)
             for existing in self.arcs_from.get(start, []):
                 if (existing.end == end and existing.arc_type == arc_type
                         and existing.flight_id == flight_id):
@@ -529,23 +530,7 @@ class CrewFlowNetwork:
                 self._arcs_by_flight = defaultdict(list)
             self._arcs_by_flight[flight_id].append(arc)
 
-        # If model exists, add variables and wire constraints
-        if self.model is not None:
-            self._add_arc_vars(arc)
-
         return arc
-
-    def _remove_arc(self, arc: Arc):
-        self.arcs.discard(arc)
-        self._arc_key_set.discard((arc.start, arc.end, arc.arc_type, arc.flight_id))
-        self.arcs_from[arc.start] = [a for a in self.arcs_from[arc.start] if a != arc]
-        self.arcs_to[arc.end]     = [a for a in self.arcs_to[arc.end]     if a != arc]
-        if self.model is not None:
-            for base in self.airports:
-                for d in (self.var_work, self.var_dh, self.var_wait):
-                    key = (base, arc)
-                    if key in d:
-                        self.model.remove(d.pop(key))
 
     def _create_wait_arc(self, from_node: Node, to_node: Node) -> Arc:
         wait_minutes = to_node.time - from_node.time
@@ -559,35 +544,18 @@ class CrewFlowNetwork:
 
     def compute_reachable_arcs(self) -> dict[str, set[int]]:
         """
-        For each base, find arcs a crew member could realistically work given
-        travel time from the base depot.
-
-        Speed strategy:
-          - ProcessPoolExecutor with an *initializer* that sends both graphs to
-            each worker process exactly once.  Individual task args are just two
-            integers (fwd_start_id, bwd_start_id) — essentially zero pickle cost
-            per task.  This avoids both the GIL (pure-Python heapq needs real
-            parallelism) and the per-call graph serialisation that caused the
-            48 s → 140 s regression with threads / per-call process args.
-          - Arc reachability is collected inline during traversal (no second scan).
-          - Forward ∩ backward intersection (fix 3b): an arc is kept only when
-            crew can reach it from depot AND still return to horizon in time.
+        For each base, find arcs reachable via forward Dijkstra from depot
+        AND backward Dijkstra from horizon (intersection = truly usable arcs).
+        Uses a process pool with graph sent once per worker via initializer.
         """
         import time as _t
         import os
         from concurrent.futures import ProcessPoolExecutor
 
         t0 = _t.time()
-        print("  Computing reachability per base (parallel Dijkstra, init-pool)...",
+        print("  Computing reachability per base (parallel Dijkstra)...",
               end="", flush=True)
 
-        # ── Build integer-keyed graphs ────────────────────────────────────────
-        # fwd_graph[node_id] = [(end_id, arrival_time, arc_id, arc_start_time)]
-        # bwd_graph[node_id] = [(start_id, dep_time,   arc_id, arc_end_time  )]
-        #   Backward Dijkstra propagates *latest feasible departure* from horizon;
-        #   using the same min-heap trick: cost = (horizon - dep_time), so
-        #   smallest cost = latest departure.  We encode as (horizon - t) so the
-        #   same _run() loop works for both directions.
         node_to_id: dict[Node, int] = {n: i for i, n in enumerate(self.nodes)}
         horizon = self.horizon_end
 
@@ -596,21 +564,15 @@ class CrewFlowNetwork:
         for arc in self.arcs:
             s = node_to_id[arc.start]
             e = node_to_id[arc.end]
-            # forward: arrive at e at arc.true_end; arc reachable if t_s <= arc.start.time
             fwd_graph[s].append((e, arc.true_end,    arc.id, arc.start.time))
-            # backward (time-reversed, costs negated so min-heap finds latest):
-            # depart e (reversed start) at (horizon - arc.start.time);
-            # arc returnable if t_e (reversed) <= (horizon - arc.true_end)
             bwd_graph[e].append((s,
                                   horizon - arc.start.time,
                                   arc.id,
                                   horizon - arc.true_end))
 
-        # Convert defaultdicts to plain dicts for faster pickling by initializer
         fwd_plain = dict(fwd_graph)
         bwd_plain = dict(bwd_graph)
 
-        # ── Build per-base task list ──────────────────────────────────────────
         task_args:  list[tuple[int, int]] = []
         base_order: list[str] = []
         for base in self.airports:
@@ -621,7 +583,6 @@ class CrewFlowNetwork:
             task_args.append((depot_id, horizon_id))
             base_order.append(base)
 
-        # ── Run in process pool; graph sent once per worker via initializer ───
         n_workers = min(len(base_order), os.cpu_count() or 4)
         with ProcessPoolExecutor(
             max_workers=n_workers,
@@ -630,7 +591,6 @@ class CrewFlowNetwork:
         ) as pool:
             pair_results = list(pool.map(_dijkstra_worker, task_args))
 
-        # ── Intersect forward ∩ backward ──────────────────────────────────────
         reachable: dict[str, set[int]] = {}
         for base, (fwd, bwd) in zip(base_order, pair_results):
             reachable[base] = fwd & bwd
@@ -653,15 +613,15 @@ class CrewFlowNetwork:
             self._flights_from[f.origin].append(f)
             self._flights_to[f.dest].append(f)
 
-    # ── Initial network ───────────────────────
+    # ── Network build ─────────────────────────
 
     def build_initial_network(self):
         import time as _t
         self._build_flight_index()
-        print("Building initial network...")
+        print("Building network...")
         t0 = _t.time()
 
-        # 1. Depot + horizon nodes
+        # 1. Depot + horizon nodes for each base
         for ap in self.airports:
             for t in (DEPOT_TIME_START, self.horizon_end):
                 node = Node(airport=ap, time=t)
@@ -669,7 +629,8 @@ class CrewFlowNetwork:
                 self.nodes_by_airport[ap].add(node)
         print(f"  Depot/horizon nodes: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
-        # 2. One node per exact flight dep/arr time
+        # 2. One node per exact flight dep/arr time — network is fully
+        #    discretised at build time, so no iterative refinement is needed.
         needed: dict[str, set[int]] = defaultdict(set)
         for f in self.flights:
             needed[f.origin].add(f.dep_min)
@@ -681,7 +642,7 @@ class CrewFlowNetwork:
                 if node in self.nodes:
                     continue
                 self.nodes.add(node)
-                self.nodes_by_airport[ap].add(node)   # O(log n) SortedList insert
+                self.nodes_by_airport[ap].add(node)
         print(f"  All nodes added: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
         # 3. Wait-arc chains
@@ -691,7 +652,7 @@ class CrewFlowNetwork:
                 self._create_wait_arc(nodes[i], nodes[i + 1])
         print(f"  Wait arcs built  ({_t.time()-t0:.1f}s)")
 
-        # 4. Flight + deadhead arcs
+        # 4. Flight arcs
         for ap in self.airports:
             depot = Node(airport=ap, time=DEPOT_TIME_START)
             self.min_duty_at[depot] = 0
@@ -725,95 +686,16 @@ class CrewFlowNetwork:
         if n_pruned_duty:
             print(f"  Duty-pruned: {n_pruned_duty} flights exceeded MAX_DUTY_MINUTES")
         print(f"  Flight arcs: {n_arcs}  ({_t.time()-t0:.1f}s)")
-        print(f"  Initial network: {len(self.nodes)} nodes, {len(self.arcs)} arcs  "
+        print(f"  Network complete: {len(self.nodes)} nodes, {len(self.arcs)} arcs  "
               f"(total {_t.time()-t0:.1f}s)")
-
-    # ── Node refinement (DDD) ─────────────────
-
-    def add_node(self, airport: str, time: int) -> Node:
-        node = Node(airport=airport, time=time)
-        if node in self.nodes:
-            return node
-
-        self.nodes.add(node)
-        self.nodes_by_airport[airport].add(node)   # SortedList.add is O(log n)
-
-        if self.model is not None:
-            self._add_flow_constr_for_node(node)
-
-        self._rewire_wait_arcs(airport, node)
-        self._create_flight_arcs_from(node)
-        self._create_flight_arcs_to(node)
-        return node
-
-    def _rewire_wait_arcs(self, airport: str, new_node: Node):
-        nodes = self.nodes_by_airport[airport]
-        pos = nodes.index(new_node)          # O(log n) on SortedList
-
-        prev_node = nodes[pos - 1] if pos > 0 else None
-        next_node = nodes[pos + 1] if pos + 1 < len(nodes) else None
-
-        if prev_node and prev_node in self.wait_arc_by_start:
-            old_arc = self.wait_arc_by_start[prev_node]
-            if old_arc.true_end >= new_node.time:
-                self._remove_arc(old_arc)
-                del self.wait_arc_by_start[prev_node]
-            self._create_wait_arc(prev_node, new_node)
-
-        if next_node:
-            self._create_wait_arc(new_node, next_node)
-        else:
-            sink = self._find_node(airport, self.horizon_end)
-            if sink and sink != new_node:
-                self._create_wait_arc(new_node, sink)
-
-    def _create_flight_arcs_from(self, node: Node):
-        duty_so_far = self.min_duty_at.get(node, 0)
-        # Use pre-built index: only flights departing from this airport
-        for f in self._flights_from.get(node.airport, []):
-            if f.dep_min < node.time:
-                continue
-            duty_after = duty_so_far + f.duration
-            if duty_after > MAX_DUTY_MINUTES:
-                continue
-            arr_node = self._find_node(f.dest, f.arr_min)
-            if arr_node is None:
-                continue
-            existing_duty = self.min_duty_at.get(arr_node, MAX_DUTY_MINUTES + 1)
-            if duty_after < existing_duty:
-                self.min_duty_at[arr_node] = duty_after
-            self._make_arc(node, arr_node, f.arr_min,
-                           f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
-
-    def _create_flight_arcs_to(self, node: Node):
-        # Use pre-built index: only flights arriving at this airport
-        for f in self._flights_to.get(node.airport, []):
-            dep_node = self._find_node(f.origin, f.dep_min)
-            if dep_node is None or dep_node.time > f.dep_min:
-                continue
-            duty_at_dep = self.min_duty_at.get(dep_node, 0)
-            duty_after  = duty_at_dep + f.duration
-            if duty_after > MAX_DUTY_MINUTES:
-                continue
-            existing_duty = self.min_duty_at.get(node, MAX_DUTY_MINUTES + 1)
-            if duty_after < existing_duty:
-                self.min_duty_at[node] = duty_after
-            self._make_arc(dep_node, node, f.arr_min,
-                           f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
 
     # ── Gurobi model ──────────────────────────
 
     def build_model(self):
         """
-        Build the LP/MIP with one integer flow variable per arc (not per crew).
+        Build the MIP with one integer flow variable per arc (not per crew).
 
-        Optimisations vs original:
-          4. Batch variable creation: addVars() with lists instead of addVar()
-             in a Python loop — 10-50× faster for large models.
-          5. Sparse constraint building: accumulate (var, node, coeff) triples
-             up front, then build all flow-balance constraints in one pass using
-             pre-computed LinExprs — avoids O(bases × nodes × arcs_per_node)
-             repeated list scans in _base_flow_out / _base_flow_in.
+        Uses batch variable creation and sparse constraint building for speed.
         """
         import time as _t
         self._ensure_attrs()
@@ -831,23 +713,18 @@ class CrewFlowNetwork:
               f"{len(self.airports)} bases  ({_t.time()-t0:.1f}s)")
 
         # ── Reachability pruning ──────────────────────────────────────────────
-        reachable = self.compute_reachable_arcs()   # base -> set[arc_id]
+        reachable = self.compute_reachable_arcs()
 
-        # ── Batch variable creation (Fix 4) ──────────────────────────────────
-        # Collect keys and attributes first, then call addVars once per type.
-
-        # Separate flight arcs from wait arcs up front
+        # ── Batch variable creation ───────────────────────────────────────────
         flight_arcs = [a for a in arc_list if a.arc_type == 'flight']
         wait_arcs   = [a for a in arc_list if a.arc_type == 'wait']
 
-        # Precompute deadhead costs once (avoid repeated dict lookups)
         dh_cost_cache: dict[int, float] = {}
         for a in flight_arcs:
             if a.flight_id not in dh_cost_cache:
                 f_obj = self.flights_by_id.get(a.flight_id)
                 dh_cost_cache[a.flight_id] = deadhead_cost(f_obj) if f_obj else a.cost
 
-        # Build (base, arc) pair lists for each variable type
         work_keys: list[tuple[str, Arc]] = []
         work_objs: list[float] = []
         dh_keys:   list[tuple[str, Arc]] = []
@@ -868,9 +745,6 @@ class CrewFlowNetwork:
                     wait_keys.append((base, arc))
                     wait_objs.append(arc.cost)
 
-        # Single addVars call per variable type (fast path through Gurobi C API).
-        # obj must be passed as a list directly — post-hoc .Obj assignment on
-        # tupledict entries does not register correctly before model.update().
         if work_keys:
             _wvars = self.model.addVars(
                 len(work_keys), lb=0, obj=work_objs, vtype=GRB.CONTINUOUS,
@@ -889,7 +763,6 @@ class CrewFlowNetwork:
                 name=[f"wt_{b}_{a.id}" for b, a in wait_keys])
             self.var_wait = {k: _wtvars[i] for i, k in enumerate(wait_keys)}
 
-        # Slack variables (one per covered flight — small, fine to loop)
         for f in self.flights:
             if not getattr(f, 'needs_coverage', True):
                 continue
@@ -905,14 +778,7 @@ class CrewFlowNetwork:
                       len(self.var_wait) + len(self.slack_var))
         print(f"  Variables: {total_vars:,}  ({_t.time()-t0:.1f}s)")
 
-        # ── Sparse flow-balance constraints (Fix 5) ───────────────────────────
-        # Instead of calling _base_flow_out / _base_flow_in per (base, node) —
-        # which re-scans arcs_from/arcs_to for every node — we make one pass
-        # over all variables, accumulating coefficients into per-(base,node) dicts.
-        # Then we build LinExprs and call addConstrs once per base.
-
-        # out_terms[base][node] = list of (var, +1)
-        # in_terms[base][node]  = list of (var, -1)
+        # ── Sparse flow-balance constraints ───────────────────────────────────
         out_terms: dict[str, dict[Node, list]] = {b: defaultdict(list) for b in self.airports}
         in_terms:  dict[str, dict[Node, list]] = {b: defaultdict(list) for b in self.airports}
 
@@ -959,10 +825,7 @@ class CrewFlowNetwork:
         self.model.update()
         print(f"  Flow balance constraints: {self.model.NumConstrs:,}  ({_t.time()-t0:.1f}s)")
 
-        # ── Coverage constraints (Fix 6 — lazy, via DDD loop) ─────────────────
-        # Only build constraints for initially-violated flights; the DDD loop
-        # will add more as they are discovered. See solve() for the violation
-        # checker that calls _add_coverage_constr lazily.
+        # ── Coverage constraints ──────────────────────────────────────────────
         arcs_by_flight = getattr(self, '_arcs_by_flight', {})
         for f in self.flights:
             if not getattr(f, 'needs_coverage', True):
@@ -974,127 +837,8 @@ class CrewFlowNetwork:
         print(f"  Model built: {self.model.NumVars:,} vars, "
               f"{self.model.NumConstrs:,} constrs  ({_t.time()-t0:.1f}s)")
 
-    def _flow_on_arc_for_base(self, base: str, arc: Arc) -> gp.LinExpr | float:
-        """Total flow on arc for a given base (work + dh, or just wait)."""
-        parts = []
-        wk = self.var_work.get((base, arc))
-        dh = self.var_dh.get((base, arc))
-        wt = self.var_wait.get((base, arc))
-        if wk is not None: parts.append(wk)
-        if dh is not None: parts.append(dh)
-        if wt is not None: parts.append(wt)
-        return gp.quicksum(parts) if parts else 0.0
-
-    def _flow_out_expr(self, node: Node) -> gp.LinExpr | float:
-        """Total outflow across ALL bases (for coverage expressions)."""
-        arcs = self.arcs_from.get(node, [])
-        parts = []
-        for arc in arcs:
-            for base in self.airports:
-                for d in (self.var_work, self.var_dh, self.var_wait):
-                    v = d.get((base, arc))
-                    if v is not None:
-                        parts.append(v)
-        return gp.quicksum(parts) if parts else 0.0
-
-    def _flow_in_expr(self, node: Node) -> gp.LinExpr | float:
-        """Total inflow across ALL bases (for coverage expressions)."""
-        arcs = self.arcs_to.get(node, [])
-        parts = []
-        for arc in arcs:
-            for base in self.airports:
-                for d in (self.var_work, self.var_dh, self.var_wait):
-                    v = d.get((base, arc))
-                    if v is not None:
-                        parts.append(v)
-        return gp.quicksum(parts) if parts else 0.0
-
-    def _base_flow_out(self, base: str, node: Node) -> gp.LinExpr | float:
-        parts = []
-        for arc in self.arcs_from.get(node, []):
-            for d in (self.var_work, self.var_dh, self.var_wait):
-                v = d.get((base, arc))
-                if v is not None:
-                    parts.append(v)
-        return gp.quicksum(parts) if parts else 0.0
-
-    def _base_flow_in(self, base: str, node: Node) -> gp.LinExpr | float:
-        parts = []
-        for arc in self.arcs_to.get(node, []):
-            for d in (self.var_work, self.var_dh, self.var_wait):
-                v = d.get((base, arc))
-                if v is not None:
-                    parts.append(v)
-        return gp.quicksum(parts) if parts else 0.0
-
-    def _add_arc_vars(self, arc: Arc):
-        """Add per-base variables for a newly created arc during DDD refinement."""
-        for base in self.airports:
-            self._add_arc_vars_for_base(base, arc)
-
-    def _add_arc_vars_for_base(self, base: str, arc: Arc):
-        """Add variables for one base on one arc, wiring into existing constraints."""
-        node_constrs = self.flow_constrs.get(base, {})
-
-        if arc.arc_type == 'flight':
-            wk = self.model.addVar(lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
-                                   name=f"fw_{base}_{arc.id}")
-            self.var_work[(base, arc)] = wk
-            f = self.flights_by_id.get(arc.flight_id)
-            dh_c = deadhead_cost(f) if f else arc.cost
-            dh = self.model.addVar(lb=0, obj=dh_c, vtype=GRB.CONTINUOUS,
-                                   name=f"fd_{base}_{arc.id}")
-            self.var_dh[(base, arc)] = dh
-            for var in (wk, dh):
-                if arc.start in node_constrs:
-                    self.model.chgCoeff(node_constrs[arc.start], var, 1)
-                if arc.end in node_constrs:
-                    self.model.chgCoeff(node_constrs[arc.end], var, -1)
-            if arc.flight_id in self.coverage_constrs:
-                self.model.chgCoeff(self.coverage_constrs[arc.flight_id], wk, 1)
-
-        elif arc.arc_type == 'wait':
-            wt = self.model.addVar(lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
-                                   name=f"wt_{base}_{arc.id}")
-            self.var_wait[(base, arc)] = wt
-            if arc.start in node_constrs:
-                self.model.chgCoeff(node_constrs[arc.start], wt, 1)
-            if arc.end in node_constrs:
-                self.model.chgCoeff(node_constrs[arc.end], wt, -1)
-
-    def _add_flow_constr_for_node(self, node: Node):
-        """Add per-base flow balance constraints for a new node (DDD refinement)."""
-        for base in self.airports:
-            supply  = self.base_crew[base]
-            depot   = Node(airport=base, time=DEPOT_TIME_START)
-            horizon = Node(airport=base, time=self.horizon_end)
-
-            out_expr = self._base_flow_out(base, node)
-            in_expr  = self._base_flow_in(base, node)
-
-            if node == depot:
-                constr = self.model.addConstr(out_expr - in_expr == supply,
-                                              name=f"flow_{base}_{node.airport}_{node.time}")
-            elif node == horizon:
-                constr = self.model.addConstr(in_expr - out_expr == supply,
-                                              name=f"flow_{base}_{node.airport}_{node.time}")
-            else:
-                constr = self.model.addConstr(out_expr == in_expr,
-                                              name=f"flow_{base}_{node.airport}_{node.time}")
-
-            if base not in self.flow_constrs:
-                self.flow_constrs[base] = {}
-            self.flow_constrs[base][node] = constr
-
     def _add_coverage_constr(self, f: 'Flight',
                              arcs_by_flight: dict | None = None) -> bool:
-        """
-        Add (or skip if already present) the coverage constraint for flight f.
-        Returns True if a new constraint was added.
-
-        Used both at model-build time and lazily during the DDD loop when a
-        newly added node creates a flight arc that was previously unconstrained.
-        """
         if f.id in self.coverage_constrs:
             return False
         if f.id not in self.slack_var:
@@ -1117,9 +861,23 @@ class CrewFlowNetwork:
         self.coverage_constrs[f.id] = constr
         return True
 
-    # ── Solve / DDD loop ──────────────────────
+    # ── Solve ─────────────────────────────────
 
-    def set_objective(self):
+    def solve(self) -> dict:
+        """
+        Solve directly as MIP. No iterative refinement needed — the network
+        already has a node at every exact flight departure and arrival time.
+        """
+        print("\n=== Solving MIP ===")
+        self._ensure_attrs()
+
+        # Switch all variables to integer
+        for d in (self.var_work, self.var_dh, self.var_wait):
+            for var in d.values():
+                var.VType = GRB.INTEGER
+        for var in self.slack_var.values():
+            var.VType = GRB.INTEGER
+
         obj = (
             gp.quicksum(arc.cost * v for (base, arc), v in self.var_work.items())
             + gp.quicksum(arc.cost * v for (base, arc), v in self.var_dh.items())
@@ -1128,125 +886,14 @@ class CrewFlowNetwork:
         )
         self.model.setObjective(obj, GRB.MINIMIZE)
 
-    def solve_lp(self) -> float:
-        self.set_objective()
-        self.model.optimize()
-        if self.model.Status == GRB.OPTIMAL:
-            slack_cost = sum(COST_UNCOVERED * var.X
-                             for var in self.slack_var.values() if var.X > 1e-4)
-            real_cost  = self.model.ObjVal - slack_cost
-            uncovered  = slack_cost / COST_UNCOVERED
-            if slack_cost > 0:
-                print(f"      (real routing cost: {real_cost:,.0f}  |  "
-                      f"uncovered slots: {uncovered:.0f}  |  slack cost: {slack_cost:,.0f})")
-            return self.model.ObjVal
-        return float('inf')
-
-    def inspect_violations(self) -> list[tuple[str, int]]:
-        """Check active arcs for time-window and turnaround violations."""
-        violations = []
-        eps = 1e-4
-
-        active_arcs: set[Arc] = set()
-        for (base, arc), var in {**self.var_work, **self.var_dh}.items():
-            try:
-                if var.X > eps:
-                    active_arcs.add(arc)
-            except AttributeError:
-                pass
-
-        for arc in active_arcs:
-            true_t   = arc.true_end
-            existing = self._find_node(arc.end.airport, true_t)
-            if existing is None or abs(existing.time - true_t) > self.time_bucket:
-                violations.append((arc.end.airport, true_t))
-
-            for next_arc in self.arcs_from.get(arc.end, []):
-                if next_arc not in active_arcs:
-                    continue
-                f = self.flights_by_id.get(next_arc.flight_id)
-                if f and arc.true_end + MIN_TURNAROUND > f.dep_min:
-                    violations.append((arc.end.airport, arc.true_end + MIN_TURNAROUND))
-
-        result = []
-        for ap, t in set(violations):
-            existing = self._find_node(ap, t)
-            if existing is None or existing.time != t:
-                result.append((ap, t))
-        return result
-
-    def make_integer(self):
-        """Switch all flow variables to integer."""
-        for d in (self.var_work, self.var_dh, self.var_wait):
-            for var in d.values():
-                var.VType = GRB.INTEGER
-        for var in self.slack_var.values():
-            var.VType = GRB.INTEGER
         self.model.setParam("OutputFlag", 1)
-        self.model.update()
-    def solve(self, max_iter: int = 200, max_violations_per_iter: int = 500) -> dict:
-        print("\n=== DDD Solve Loop (Flow) ===")
-        self._ensure_attrs()
-        solved = False
-        prev_violations = None
-
-        for iteration in range(max_iter):
-            obj = self.solve_lp()
-            print(f"  Iter {iteration:3d}: LP obj = {obj:,.1f}", end="")
-
-            if self.model.Status != GRB.OPTIMAL:
-                print(" [INFEASIBLE/UNBOUNDED — stopping]")
-                break
-
-            violations = self.inspect_violations()
-            n_total = len(violations)
-            print(f"  |  violations = {n_total}", end="")
-
-            if not violations:
-                print()
-                print("  LP converged. Switching to MIP...")
-                solved = True
-                break
-
-            if prev_violations is not None and n_total > prev_violations * 1.5:
-                print(f"  [WARNING: violations growing {prev_violations}→{n_total}]", end="")
-            prev_violations = n_total
-
-            if n_total > max_violations_per_iter:
-                violations = violations[:max_violations_per_iter]
-                print(f"  [capped to {max_violations_per_iter}]", end="")
-
-            print()
-            for ap, t in violations:
-                self.add_node(ap, t)
-
-            # Fix 6 — Lazy coverage constraints: after DDD inserts new nodes,
-            # new flight arcs may have been created for flights that had no
-            # arc (and therefore no coverage constraint) in the previous network.
-            # Add any missing coverage constraints now rather than upfront.
-            arcs_by_flight = getattr(self, '_arcs_by_flight', {})
-            n_new_cov = 0
-            for f in self.flights:
-                if getattr(f, 'needs_coverage', True):
-                    if self._add_coverage_constr(f, arcs_by_flight):
-                        n_new_cov += 1
-            if n_new_cov:
-                print(f"    (+{n_new_cov} new coverage constraints)")
-
-            self.model.update()
-
-        if not solved:
-            print("  Warning: DDD loop did not fully converge. Solving MIP on current network.")
-
-        self.make_integer()
-        self.set_objective()
         self.model.setParam("MIPGap", 0.01)
         self.model.setParam("TimeLimit", 300)
-        self.model.setParam("Threads", 0)          # use all available cores
-        self.model.setParam("Method", 2)           # barrier LP — faster for network LPs
-        self.model.setParam("Presolve", 2)         # aggressive presolve
-        self.model.setParam("MIPFocus", 1)         # find good feasible solutions fast
-        self.model.setParam("Heuristics", 0.3)     # more MIP heuristics
+        self.model.setParam("Threads", 0)
+        self.model.setParam("Method", 2)
+        self.model.setParam("Presolve", 2)
+        self.model.setParam("MIPFocus", 1)
+        self.model.setParam("Heuristics", 0.3)
         self.model.optimize()
 
         return self.extract_solution()
@@ -1261,7 +908,6 @@ class CrewFlowNetwork:
 
         obj = self.model.ObjVal
 
-        # Uncovered flights
         uncovered = []
         for f in self.flights:
             if f.id in self.slack_var:
@@ -1269,7 +915,6 @@ class CrewFlowNetwork:
                 if sv > eps:
                     uncovered.append((f, sv))
 
-        # Cost breakdown
         flight_cost  = sum(arc.cost * v.X
                            for (base, arc), v in self.var_work.items() if v.X > eps)
         dh_base_cost = 0.0
@@ -1289,7 +934,6 @@ class CrewFlowNetwork:
         wait_cost = sum(arc.cost * v.X
                         for (base, arc), v in self.var_wait.items() if v.X > eps)
 
-        # Stage 2: decompose flows into named-crew routes
         routes = self._decompose_routes()
 
         return {
@@ -1315,19 +959,12 @@ class CrewFlowNetwork:
         """
         Decompose integer arc flows into individual crew routes.
 
-        Algorithm:
-          For each base b:
-            Build a residual flow graph with integer capacities from solution.
-            Repeatedly trace paths from depot(b) to horizon(b), each consuming
-            1 unit of flow. Each path becomes one crew member's route.
-            Assign named crew IDs from this base's crew pool.
-
-        This recovers full individual routes — each crew member starts and ends
-        at their home base. Crew identity is fully preserved post-solve.
+        For each base b:
+          Build a residual flow graph with integer capacities from solution.
+          Repeatedly trace paths from depot(b) to horizon(b), each consuming
+          1 unit of flow. Each path becomes one crew member's route.
+          Assign named crew IDs from this base's crew pool.
         """
-        eps = 0.5  # integer rounding threshold
-
-        # Build residual capacity per base: (base, arc) -> remaining integer flow
         residual: dict[tuple[str, Arc], int] = {}
         for (base, arc), var in self.var_work.items():
             val = round(var.X)
@@ -1342,8 +979,7 @@ class CrewFlowNetwork:
             if val > 0:
                 residual[(base, arc)] = residual.get((base, arc), 0) + val
 
-        # Track which (base, arc) pairs are working vs deadheading for leg labels
-        arc_is_work_for_base: set[tuple[str, int]] = set()  # (base, arc.id)
+        arc_is_work_for_base: set[tuple[str, int]] = set()
         for (base, arc), var in self.var_work.items():
             if round(var.X) > 0:
                 arc_is_work_for_base.add((base, arc.id))
@@ -1358,7 +994,6 @@ class CrewFlowNetwork:
             base_crew_ids = [c.id for c in self.crew if c.base == base]
             crew_idx = 0
 
-            # Build a base-specific residual for path tracing
             base_residual: dict[Arc, int] = {}
             for (b, arc), cap in residual.items():
                 if b == base and cap > 0:
@@ -1378,10 +1013,7 @@ class CrewFlowNetwork:
                 for arc in path_arcs:
                     if arc.arc_type == 'wait':
                         continue
-                    if (base, arc.id) in arc_is_work_for_base:
-                        leg_type = 'flight'
-                    else:
-                        leg_type = 'deadhead'
+                    leg_type = 'flight' if (base, arc.id) in arc_is_work_for_base else 'deadhead'
                     legs.append({
                         "type":      leg_type,
                         "from":      arc.start.airport,
@@ -1411,14 +1043,10 @@ class CrewFlowNetwork:
         """
         Greedy DFS from source to sink through residual flow graph.
         Returns list of arcs forming one unit-flow path, or None if none exists.
-        Prefers flight > deadhead > wait arcs to produce meaningful pairings.
-
-        Uses a parent-pointer dict instead of copying the path list at every
-        stack push — O(path_length) reconstruction vs O(path_length²) before.
+        Prefers flight > deadhead > wait arcs for meaningful pairings.
         """
         type_priority = {'flight': 0, 'deadhead': 1, 'wait': 2}
 
-        # parent[node] = arc that led to node (None for source)
         parent: dict[Node, Arc | None] = {source: None}
         stack = [source]
 
@@ -1426,7 +1054,6 @@ class CrewFlowNetwork:
             node = stack.pop()
 
             if node == sink:
-                # Reconstruct path by walking parent pointers back to source
                 path: list[Arc] = []
                 cur = sink
                 while parent[cur] is not None:
@@ -1440,7 +1067,6 @@ class CrewFlowNetwork:
                 a for a in self.arcs_from.get(node, [])
                 if residual.get(a, 0) > 0 and a.end not in parent
             ]
-            # Sort ascending so that reversed push order puts best arc on top
             candidates.sort(key=lambda a: (type_priority.get(a.arc_type, 9), a.end.time))
 
             for arc in reversed(candidates):
@@ -1567,7 +1193,7 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
             print(f"  Saved ({os.path.getsize(cache_path)/1e6:.1f} MB)")
 
     net.build_model()
-    result = net.solve(max_iter=50)
+    result = net.solve()
 
     t1 = _time.time()
 
@@ -1594,7 +1220,7 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
                   f"dep={f.dep_min//60:02d}:{f.dep_min%60:02d}  "
                   f"need {f.min_crew} crew, missing {slots:.1f}")
 
-    for i, route in enumerate(result['routes'][:20]):  # print first 20
+    for i, route in enumerate(result['routes'][:20]):
         print(f"\n  Route {i+1} | Crew #{route['crew_id']} | Base: {route['base']}")
         for leg in route['legs']:
             dep_h, dep_m = divmod(leg['dep'], 60)
@@ -1605,7 +1231,6 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
                   f"Day{day_dep+1} {dep_h%24:02d}:{dep_m:02d} -> "
                   f"Day{day_arr+1} {arr_h%24:02d}:{arr_m:02d}")
 
-    import os
     result_path = os.path.splitext(csv_path)[0] + "_result.json"
     save_result(result, net, out_path=result_path)
 
