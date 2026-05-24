@@ -5,3 +5,4 @@ data/flights_enriched copy.csv
 talk/talk.mov
 *.pkl
 *.pkl
+*.pkl

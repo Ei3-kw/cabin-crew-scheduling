@@ -54,7 +54,7 @@ from sortedcontainers import SortedList
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-DAYS_TO_SOLVE      = 3
+DAYS_TO_SOLVE      = 1
 RETURN_WINDOW      = 7
 RANDOM_SEED        = 42069
 MIN_CREW_PER_BASE  = 5
@@ -297,6 +297,60 @@ def _sorted_node_list():
     """Module-level factory for SortedList — required for pickle compatibility."""
     return SortedList(key=_node_time_key)
 
+# Module-level globals populated by the process-pool initializer.
+# Each worker process receives the graph once via the initializer,
+# so individual task args are just (fwd_start_id, bwd_start_id) — tiny to pickle.
+_WORKER_FWD_GRAPH: dict = {}
+_WORKER_BWD_GRAPH: dict = {}
+_WORKER_HORIZON:   int  = 0
+
+
+def _worker_init(fwd_graph: dict, bwd_graph: dict, horizon: int) -> None:
+    """Initializer for ProcessPoolExecutor workers: store shared graph once."""
+    global _WORKER_FWD_GRAPH, _WORKER_BWD_GRAPH, _WORKER_HORIZON
+    _WORKER_FWD_GRAPH = fwd_graph
+    _WORKER_BWD_GRAPH = bwd_graph
+    _WORKER_HORIZON   = horizon
+
+
+def _dijkstra_worker(args: tuple) -> tuple[set[int], set[int]]:
+    """
+    Process-pool worker: forward + backward Dijkstra for one base.
+
+    args: (fwd_start_id, bwd_start_id)
+    Returns (fwd_reachable_arc_ids, bwd_reachable_arc_ids).
+
+    Both graphs live in module-level globals set by _worker_init — sent once
+    per worker process, NOT re-pickled for every task.  Task args are just two
+    integers, eliminating the O(|arcs|) serialisation that caused the 48s→140s
+    regression when the graph was passed per-call.
+    """
+    import heapq
+    fwd_start, bwd_start = args
+    graph   = _WORKER_FWD_GRAPH
+    bgraph  = _WORKER_BWD_GRAPH
+    horizon = _WORKER_HORIZON
+
+    def _run(start_id: int, g: dict) -> set[int]:
+        earliest: dict[int, int] = {start_id: 0}
+        heap = [(0, start_id)]
+        reached: set[int] = set()
+        while heap:
+            t, nid = heapq.heappop(heap)
+            if t > earliest.get(nid, horizon + 1):
+                continue
+            for eid, arr, arc_id, arc_start_t in g.get(nid, []):
+                if arr > horizon:
+                    continue
+                if t <= arc_start_t:
+                    reached.add(arc_id)
+                if arr < earliest.get(eid, horizon + 1):
+                    earliest[eid] = arr
+                    heapq.heappush(heap, (arr, eid))
+        return reached
+
+    return _run(fwd_start, graph), _run(bwd_start, bgraph)
+
 
 class CrewFlowNetwork:
 
@@ -505,63 +559,88 @@ class CrewFlowNetwork:
 
     def compute_reachable_arcs(self) -> dict[str, set[int]]:
         """
-        For each base, find arcs reachable from its depot via forward BFS.
+        For each base, find arcs a crew member could realistically work given
+        travel time from the base depot.
 
-        Uses scipy.sparse.csgraph.breadth_first_order which runs BFS in compiled
-        C rather than Python, giving ~100x speedup over pure-Python BFS loops.
-
-        Steps:
-          1. Map all nodes to integer IDs, build a CSR adjacency matrix.
-          2. For each base depot, call breadth_first_order to get all reachable
-             node IDs in O(N + E) time (C speed).
-          3. Mark arcs whose start node is in the reachable set.
-
-        Returns: dict mapping base -> set of reachable arc IDs
+        Speed strategy:
+          - ProcessPoolExecutor with an *initializer* that sends both graphs to
+            each worker process exactly once.  Individual task args are just two
+            integers (fwd_start_id, bwd_start_id) — essentially zero pickle cost
+            per task.  This avoids both the GIL (pure-Python heapq needs real
+            parallelism) and the per-call graph serialisation that caused the
+            48 s → 140 s regression with threads / per-call process args.
+          - Arc reachability is collected inline during traversal (no second scan).
+          - Forward ∩ backward intersection (fix 3b): an arc is kept only when
+            crew can reach it from depot AND still return to horizon in time.
         """
         import time as _t
-        import numpy as np
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.csgraph import breadth_first_order
+        import os
+        from concurrent.futures import ProcessPoolExecutor
 
         t0 = _t.time()
-        print(f"  Computing reachability per base (scipy BFS)...", end="", flush=True)
+        print("  Computing reachability per base (parallel Dijkstra, init-pool)...",
+              end="", flush=True)
 
-        # Integer-index all nodes
-        node_list = list(self.nodes)
-        node_idx  = {n: i for i, n in enumerate(node_list)}
-        N = len(node_list)
+        # ── Build integer-keyed graphs ────────────────────────────────────────
+        # fwd_graph[node_id] = [(end_id, arrival_time, arc_id, arc_start_time)]
+        # bwd_graph[node_id] = [(start_id, dep_time,   arc_id, arc_end_time  )]
+        #   Backward Dijkstra propagates *latest feasible departure* from horizon;
+        #   using the same min-heap trick: cost = (horizon - dep_time), so
+        #   smallest cost = latest departure.  We encode as (horizon - t) so the
+        #   same _run() loop works for both directions.
+        node_to_id: dict[Node, int] = {n: i for i, n in enumerate(self.nodes)}
+        horizon = self.horizon_end
 
-        # Build CSR: one entry per arc  (row=end node, col=start node)
-        arc_list      = list(self.arcs)
-        arc_ids       = np.array([a.id    for a in arc_list], dtype=np.int32)
-        arc_start_idx = np.array([node_idx[a.start] for a in arc_list], dtype=np.int32)
-        arc_end_idx   = np.array([node_idx[a.end]   for a in arc_list], dtype=np.int32)
+        fwd_graph: dict[int, list] = defaultdict(list)
+        bwd_graph: dict[int, list] = defaultdict(list)
+        for arc in self.arcs:
+            s = node_to_id[arc.start]
+            e = node_to_id[arc.end]
+            # forward: arrive at e at arc.true_end; arc reachable if t_s <= arc.start.time
+            fwd_graph[s].append((e, arc.true_end,    arc.id, arc.start.time))
+            # backward (time-reversed, costs negated so min-heap finds latest):
+            # depart e (reversed start) at (horizon - arc.start.time);
+            # arc returnable if t_e (reversed) <= (horizon - arc.true_end)
+            bwd_graph[e].append((s,
+                                  horizon - arc.start.time,
+                                  arc.id,
+                                  horizon - arc.true_end))
 
-        data = np.ones(len(arc_list), dtype=np.float32)
-        # G[i,j] = 1 means directed edge from node i to node j
-        G = csr_matrix((data, (arc_start_idx, arc_end_idx)), shape=(N, N))
+        # Convert defaultdicts to plain dicts for faster pickling by initializer
+        fwd_plain = dict(fwd_graph)
+        bwd_plain = dict(bwd_graph)
 
+        # ── Build per-base task list ──────────────────────────────────────────
+        task_args:  list[tuple[int, int]] = []
+        base_order: list[str] = []
+        for base in self.airports:
+            depot_id   = node_to_id.get(Node(airport=base, time=DEPOT_TIME_START))
+            horizon_id = node_to_id.get(Node(airport=base, time=horizon))
+            if depot_id is None or horizon_id is None:
+                continue
+            task_args.append((depot_id, horizon_id))
+            base_order.append(base)
+
+        # ── Run in process pool; graph sent once per worker via initializer ───
+        n_workers = min(len(base_order), os.cpu_count() or 4)
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_worker_init,
+            initargs=(fwd_plain, bwd_plain, horizon),
+        ) as pool:
+            pair_results = list(pool.map(_dijkstra_worker, task_args))
+
+        # ── Intersect forward ∩ backward ──────────────────────────────────────
         reachable: dict[str, set[int]] = {}
+        for base, (fwd, bwd) in zip(base_order, pair_results):
+            reachable[base] = fwd & bwd
 
         for base in self.airports:
-            depot = Node(airport=base, time=DEPOT_TIME_START)
-            if depot not in node_idx:
-                reachable[base] = set()
-                continue
-
-            # breadth_first_order returns array of node indices visited from depot
-            visited = breadth_first_order(
-                G, i_start=node_idx[depot],
-                directed=True, return_predecessors=False
-            )
-
-            # An arc is reachable if its start node was visited
-            mask = np.isin(arc_start_idx, visited)
-            reachable[base] = set(arc_ids[mask].tolist())
+            reachable.setdefault(base, set())
 
         total_pairs = sum(len(v) for v in reachable.values())
         full_pairs  = len(self.airports) * len(self.arcs)
-        pct = 100.0 * total_pairs / full_pairs if full_pairs else 0
+        pct = 100.0 * total_pairs / full_pairs if full_pairs else 0.0
         print(f" done ({_t.time()-t0:.1f}s)")
         print(f"  Reachable (base,arc) pairs: {total_pairs:,} / {full_pairs:,} "
               f"= {pct:.1f}% of full cross-product")
@@ -728,8 +807,13 @@ class CrewFlowNetwork:
         """
         Build the LP/MIP with one integer flow variable per arc (not per crew).
 
-        The total number of variables is O(|arcs|), independent of crew count.
-        Flow balance is enforced per base airport at each node.
+        Optimisations vs original:
+          4. Batch variable creation: addVars() with lists instead of addVar()
+             in a Python loop — 10-50× faster for large models.
+          5. Sparse constraint building: accumulate (var, node, coeff) triples
+             up front, then build all flow-balance constraints in one pass using
+             pre-computed LinExprs — avoids O(bases × nodes × arcs_per_node)
+             repeated list scans in _base_flow_out / _base_flow_in.
         """
         import time as _t
         self._ensure_attrs()
@@ -746,34 +830,66 @@ class CrewFlowNetwork:
         print(f"  Building flow model: {n_arcs} arcs, {n_nodes} nodes, "
               f"{len(self.airports)} bases  ({_t.time()-t0:.1f}s)")
 
-        # ── Reachability pruning ──────────────────────────────────────────
-        # Only create (base, arc) variables for arcs physically reachable
-        # from that base's depot. Reduces variables from O(|bases|×|arcs|)
-        # to O(reachable pairs) — typically 5-15% of the full cross-product.
-        arc_id_to_arc = {arc.id: arc for arc in arc_list}
-        reachable = self.compute_reachable_arcs()  # base -> set of arc IDs
+        # ── Reachability pruning ──────────────────────────────────────────────
+        reachable = self.compute_reachable_arcs()   # base -> set[arc_id]
 
-        # ── Per-base flow variables (reachable pairs only) ────────────────
+        # ── Batch variable creation (Fix 4) ──────────────────────────────────
+        # Collect keys and attributes first, then call addVars once per type.
+
+        # Separate flight arcs from wait arcs up front
+        flight_arcs = [a for a in arc_list if a.arc_type == 'flight']
+        wait_arcs   = [a for a in arc_list if a.arc_type == 'wait']
+
+        # Precompute deadhead costs once (avoid repeated dict lookups)
+        dh_cost_cache: dict[int, float] = {}
+        for a in flight_arcs:
+            if a.flight_id not in dh_cost_cache:
+                f_obj = self.flights_by_id.get(a.flight_id)
+                dh_cost_cache[a.flight_id] = deadhead_cost(f_obj) if f_obj else a.cost
+
+        # Build (base, arc) pair lists for each variable type
+        work_keys: list[tuple[str, Arc]] = []
+        work_objs: list[float] = []
+        dh_keys:   list[tuple[str, Arc]] = []
+        dh_objs:   list[float] = []
+        wait_keys: list[tuple[str, Arc]] = []
+        wait_objs: list[float] = []
+
         for base in self.airports:
-            reachable_ids = reachable[base]
-            for arc in arc_list:
-                if arc.id not in reachable_ids:
-                    continue
-                if arc.arc_type == 'flight':
-                    f_obj = self.flights_by_id.get(arc.flight_id)
-                    dh_c  = deadhead_cost(f_obj) if f_obj else arc.cost
-                    self.var_work[(base, arc)] = self.model.addVar(
-                        lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
-                        name=f"fw_{base}_{arc.id}")
-                    self.var_dh[(base, arc)] = self.model.addVar(
-                        lb=0, obj=dh_c, vtype=GRB.CONTINUOUS,
-                        name=f"fd_{base}_{arc.id}")
-                elif arc.arc_type == 'wait':
-                    self.var_wait[(base, arc)] = self.model.addVar(
-                        lb=0, obj=arc.cost, vtype=GRB.CONTINUOUS,
-                        name=f"wt_{base}_{arc.id}")
+            reach = reachable[base]
+            for arc in flight_arcs:
+                if arc.id in reach:
+                    work_keys.append((base, arc))
+                    work_objs.append(arc.cost)
+                    dh_keys.append((base, arc))
+                    dh_objs.append(dh_cost_cache[arc.flight_id])
+            for arc in wait_arcs:
+                if arc.id in reach:
+                    wait_keys.append((base, arc))
+                    wait_objs.append(arc.cost)
 
-        # Slack variables for coverage
+        # Single addVars call per variable type (fast path through Gurobi C API).
+        # obj must be passed as a list directly — post-hoc .Obj assignment on
+        # tupledict entries does not register correctly before model.update().
+        if work_keys:
+            _wvars = self.model.addVars(
+                len(work_keys), lb=0, obj=work_objs, vtype=GRB.CONTINUOUS,
+                name=[f"fw_{b}_{a.id}" for b, a in work_keys])
+            self.var_work = {k: _wvars[i] for i, k in enumerate(work_keys)}
+
+        if dh_keys:
+            _dvars = self.model.addVars(
+                len(dh_keys), lb=0, obj=dh_objs, vtype=GRB.CONTINUOUS,
+                name=[f"fd_{b}_{a.id}" for b, a in dh_keys])
+            self.var_dh = {k: _dvars[i] for i, k in enumerate(dh_keys)}
+
+        if wait_keys:
+            _wtvars = self.model.addVars(
+                len(wait_keys), lb=0, obj=wait_objs, vtype=GRB.CONTINUOUS,
+                name=[f"wt_{b}_{a.id}" for b, a in wait_keys])
+            self.var_wait = {k: _wtvars[i] for i, k in enumerate(wait_keys)}
+
+        # Slack variables (one per covered flight — small, fine to loop)
         for f in self.flights:
             if not getattr(f, 'needs_coverage', True):
                 continue
@@ -789,21 +905,39 @@ class CrewFlowNetwork:
                       len(self.var_wait) + len(self.slack_var))
         print(f"  Variables: {total_vars:,}  ({_t.time()-t0:.1f}s)")
 
-        # ── Flow balance: one constraint per BASE per NODE ────────────────
-        # For each base b and each node n:
-        #   sum_{a leaving n} flow_b[a]  ==  sum_{a entering n} flow_b[a]
-        # with supply  = base_crew[b] at depot   node (b, t=0)
-        #      demand  = base_crew[b] at horizon node (b, t=end)
-        # This ensures exactly base_crew[b] crew depart from and return to base b.
+        # ── Sparse flow-balance constraints (Fix 5) ───────────────────────────
+        # Instead of calling _base_flow_out / _base_flow_in per (base, node) —
+        # which re-scans arcs_from/arcs_to for every node — we make one pass
+        # over all variables, accumulating coefficients into per-(base,node) dicts.
+        # Then we build LinExprs and call addConstrs once per base.
+
+        # out_terms[base][node] = list of (var, +1)
+        # in_terms[base][node]  = list of (var, -1)
+        out_terms: dict[str, dict[Node, list]] = {b: defaultdict(list) for b in self.airports}
+        in_terms:  dict[str, dict[Node, list]] = {b: defaultdict(list) for b in self.airports}
+
+        for (base, arc), var in self.var_work.items():
+            out_terms[base][arc.start].append(var)
+            in_terms[base][arc.end].append(var)
+        for (base, arc), var in self.var_dh.items():
+            out_terms[base][arc.start].append(var)
+            in_terms[base][arc.end].append(var)
+        for (base, arc), var in self.var_wait.items():
+            out_terms[base][arc.start].append(var)
+            in_terms[base][arc.end].append(var)
+
         for base in self.airports:
             supply  = self.base_crew[base]
             depot   = Node(airport=base, time=DEPOT_TIME_START)
             horizon = Node(airport=base, time=self.horizon_end)
             self.flow_constrs[base] = {}
 
+            outs = out_terms[base]
+            ins  = in_terms[base]
+
             for node in node_list:
-                out_expr = self._base_flow_out(base, node)
-                in_expr  = self._base_flow_in(base, node)
+                out_expr = gp.quicksum(outs.get(node, []))
+                in_expr  = gp.quicksum(ins.get(node, []))
 
                 if node == depot:
                     constr = self.model.addConstr(
@@ -817,7 +951,7 @@ class CrewFlowNetwork:
                     )
                 else:
                     constr = self.model.addConstr(
-                        out_expr == in_expr,
+                        out_expr - in_expr == 0,
                         name=f"flow_{base}_{node.airport}_{node.time}"
                     )
                 self.flow_constrs[base][node] = constr
@@ -825,26 +959,15 @@ class CrewFlowNetwork:
         self.model.update()
         print(f"  Flow balance constraints: {self.model.NumConstrs:,}  ({_t.time()-t0:.1f}s)")
 
-        # Coverage: sum over all bases of working flow >= min_crew
+        # ── Coverage constraints (Fix 6 — lazy, via DDD loop) ─────────────────
+        # Only build constraints for initially-violated flights; the DDD loop
+        # will add more as they are discovered. See solve() for the violation
+        # checker that calls _add_coverage_constr lazily.
         arcs_by_flight = getattr(self, '_arcs_by_flight', {})
         for f in self.flights:
             if not getattr(f, 'needs_coverage', True):
                 continue
-            flight_arcs = [a for a in arcs_by_flight.get(f.id, [])
-                           if a.arc_type == 'flight']
-            if not flight_arcs:
-                continue
-            coverage_expr = gp.quicksum(
-                self.var_work[(base, arc)]
-                for base in self.airports
-                for arc in flight_arcs
-                if (base, arc) in self.var_work
-            )
-            constr = self.model.addConstr(
-                coverage_expr + self.slack_var[f.id] >= f.min_crew,
-                name=f"cov_{f.id}"
-            )
-            self.coverage_constrs[f.id] = constr
+            self._add_coverage_constr(f, arcs_by_flight)
 
         self.model.update()
         print(f"  Coverage constraints: {len(self.coverage_constrs)}  ({_t.time()-t0:.1f}s)")
@@ -963,6 +1086,37 @@ class CrewFlowNetwork:
                 self.flow_constrs[base] = {}
             self.flow_constrs[base][node] = constr
 
+    def _add_coverage_constr(self, f: 'Flight',
+                             arcs_by_flight: dict | None = None) -> bool:
+        """
+        Add (or skip if already present) the coverage constraint for flight f.
+        Returns True if a new constraint was added.
+
+        Used both at model-build time and lazily during the DDD loop when a
+        newly added node creates a flight arc that was previously unconstrained.
+        """
+        if f.id in self.coverage_constrs:
+            return False
+        if f.id not in self.slack_var:
+            return False
+        adict = arcs_by_flight if arcs_by_flight is not None else getattr(
+            self, '_arcs_by_flight', {})
+        flight_arcs = [a for a in adict.get(f.id, []) if a.arc_type == 'flight']
+        if not flight_arcs:
+            return False
+        coverage_expr = gp.quicksum(
+            self.var_work[(base, arc)]
+            for base in self.airports
+            for arc in flight_arcs
+            if (base, arc) in self.var_work
+        )
+        constr = self.model.addConstr(
+            coverage_expr + self.slack_var[f.id] >= f.min_crew,
+            name=f"cov_{f.id}"
+        )
+        self.coverage_constrs[f.id] = constr
+        return True
+
     # ── Solve / DDD loop ──────────────────────
 
     def set_objective(self):
@@ -1065,6 +1219,20 @@ class CrewFlowNetwork:
             print()
             for ap, t in violations:
                 self.add_node(ap, t)
+
+            # Fix 6 — Lazy coverage constraints: after DDD inserts new nodes,
+            # new flight arcs may have been created for flights that had no
+            # arc (and therefore no coverage constraint) in the previous network.
+            # Add any missing coverage constraints now rather than upfront.
+            arcs_by_flight = getattr(self, '_arcs_by_flight', {})
+            n_new_cov = 0
+            for f in self.flights:
+                if getattr(f, 'needs_coverage', True):
+                    if self._add_coverage_constr(f, arcs_by_flight):
+                        n_new_cov += 1
+            if n_new_cov:
+                print(f"    (+{n_new_cov} new coverage constraints)")
+
             self.model.update()
 
         if not solved:
