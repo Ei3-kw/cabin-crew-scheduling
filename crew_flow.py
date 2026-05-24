@@ -49,11 +49,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import gurobipy as gp
 from gurobipy import GRB
+from sortedcontainers import SortedList
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-DAYS_TO_SOLVE      = 4
+DAYS_TO_SOLVE      = 3
 RETURN_WINDOW      = 7
 RANDOM_SEED        = 42069
 MIN_CREW_PER_BASE  = 5
@@ -289,7 +290,16 @@ def deadhead_cost(flight: Flight, load_factor: float | None = None) -> float:
 # FLOW NETWORK
 # ─────────────────────────────────────────────
 
+def _node_time_key(n: Node) -> int:
+    return n.time
+
+def _sorted_node_list():
+    """Module-level factory for SortedList — required for pickle compatibility."""
+    return SortedList(key=_node_time_key)
+
+
 class CrewFlowNetwork:
+
     """
     Time-expanded network for cabin crew pairing via integer flow + DDD.
 
@@ -341,15 +351,17 @@ class CrewFlowNetwork:
         self.verbose     = verbose
 
         # Network topology
-        self.nodes:             set[Node]              = set()
-        self.nodes_by_airport:  dict[str, list[Node]]  = defaultdict(list)
-        self.arcs:              set[Arc]               = set()
+        self.nodes:             set[Node]                       = set()
+        self.nodes_by_airport:  dict[str, SortedList]           = defaultdict(
+            _sorted_node_list)
+        self.arcs:              set[Arc]                        = set()
         self._arc_counter       = 0
-        self.arcs_from:         dict[Node, list[Arc]]  = defaultdict(list)
-        self.arcs_to:           dict[Node, list[Arc]]  = defaultdict(list)
-        self.wait_arc_by_start: dict[Node, Arc]        = {}
-        self._arcs_by_flight:   dict[int, list[Arc]]   = defaultdict(list)
-        self.min_duty_at:       dict[Node, int]        = {}
+        self._arc_key_set:      set[tuple]                      = set()   # dedup
+        self.arcs_from:         dict[Node, list[Arc]]           = defaultdict(list)
+        self.arcs_to:           dict[Node, list[Arc]]           = defaultdict(list)
+        self.wait_arc_by_start: dict[Node, Arc]                 = {}
+        self._arcs_by_flight:   dict[int, list[Arc]]            = defaultdict(list)
+        self.min_duty_at:       dict[Node, int]                 = {}
 
         # Gurobi model
         self.model: gp.Model | None = None
@@ -369,7 +381,8 @@ class CrewFlowNetwork:
 
     # ── Pickle compatibility ──────────────────
     CACHE_VERSION = 1
-    _ATTR_DEFAULTS: dict = {'min_duty_at': {}, '_arcs_by_flight': {}}
+    _ATTR_DEFAULTS: dict = {'min_duty_at': {}, '_arcs_by_flight': {},
+                            '_arc_key_set': set()}
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -378,7 +391,6 @@ class CrewFlowNetwork:
                     'slack_var', 'flow_constrs', 'coverage_constrs'):
             state.pop(key, None)
         return state
-        return state
 
     def __setstate__(self, state):
         import copy
@@ -386,11 +398,26 @@ class CrewFlowNetwork:
                     'flow_constrs', 'coverage_constrs'):
             state.setdefault(key, {})
         state.setdefault('model', None)
-        loaded_version = state.pop('_cache_version', 0)
+        state.pop('_cache_version', 0)
         for attr, default in self._ATTR_DEFAULTS.items():
             if attr not in state:
                 state[attr] = copy.deepcopy(default)
         self.__dict__.update(state)
+
+        # Rebuild nodes_by_airport as SortedList (handles old plain-list pickles)
+        nba = self.nodes_by_airport
+        if nba and not isinstance(next(iter(nba.values()), None), SortedList):
+            new_nba = defaultdict(_sorted_node_list)
+            for ap, nodes in nba.items():
+                for n in nodes:
+                    new_nba[ap].add(n)
+            self.nodes_by_airport = new_nba
+
+        # Rebuild arc dedup set from existing arcs
+        if not self._arc_key_set and self.arcs:
+            self._arc_key_set = {
+                (a.start, a.end, a.arc_type, a.flight_id) for a in self.arcs
+            }
 
     def _ensure_attrs(self):
         import copy
@@ -401,35 +428,37 @@ class CrewFlowNetwork:
     # ── Node helpers ─────────────────────────
 
     def _find_node(self, airport: str, time: int, round_down=True) -> Node | None:
-        import bisect
         nodes = self.nodes_by_airport[airport]
         if not nodes:
             return None
-        times = [n.time for n in nodes]
         if round_down:
-            idx = bisect.bisect_right(times, time) - 1
+            # bisect_key_right gives first index > time; step back one
+            idx = nodes.bisect_key_right(time) - 1
             return nodes[idx] if idx >= 0 else None
         else:
-            idx = bisect.bisect_left(times, time)
+            idx = nodes.bisect_key_left(time)
             return nodes[idx] if idx < len(nodes) else None
 
     def _find_node_at_or_after(self, airport: str, time: int) -> Node | None:
-        import bisect
         nodes = self.nodes_by_airport[airport]
         if not nodes:
             return None
-        times = [n.time for n in nodes]
-        idx = bisect.bisect_left(times, time)
+        idx = nodes.bisect_key_left(time)
         return nodes[idx] if idx < len(nodes) else None
 
     # ── Arc creation ─────────────────────────
 
     def _make_arc(self, start: Node, end: Node, true_end: int,
                   cost: float, arc_type: str, flight_id: int | None = None) -> Arc:
-        for existing in self.arcs_from.get(start, []):
-            if (existing.end == end and existing.arc_type == arc_type
-                    and existing.flight_id == flight_id):
-                return existing
+        key = (start, end, arc_type, flight_id)
+        if key in self._arc_key_set:
+            # Return the existing arc (scan is now just the dedup set)
+            for existing in self.arcs_from.get(start, []):
+                if (existing.end == end and existing.arc_type == arc_type
+                        and existing.flight_id == flight_id):
+                    return existing
+
+        self._arc_key_set.add(key)
 
         arc = Arc(
             id=self._arc_counter,
@@ -454,6 +483,7 @@ class CrewFlowNetwork:
 
     def _remove_arc(self, arc: Arc):
         self.arcs.discard(arc)
+        self._arc_key_set.discard((arc.start, arc.end, arc.arc_type, arc.flight_id))
         self.arcs_from[arc.start] = [a for a in self.arcs_from[arc.start] if a != arc]
         self.arcs_to[arc.end]     = [a for a in self.arcs_to[arc.end]     if a != arc]
         if self.model is not None:
@@ -547,7 +577,7 @@ class CrewFlowNetwork:
     # ── Initial network ───────────────────────
 
     def build_initial_network(self):
-        import bisect, time as _t
+        import time as _t
         self._build_flight_index()
         print("Building initial network...")
         t0 = _t.time()
@@ -557,7 +587,7 @@ class CrewFlowNetwork:
             for t in (DEPOT_TIME_START, self.horizon_end):
                 node = Node(airport=ap, time=t)
                 self.nodes.add(node)
-                self.nodes_by_airport[ap].append(node)
+                self.nodes_by_airport[ap].add(node)
         print(f"  Depot/horizon nodes: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
         # 2. One node per exact flight dep/arr time
@@ -572,9 +602,7 @@ class CrewFlowNetwork:
                 if node in self.nodes:
                     continue
                 self.nodes.add(node)
-                tlist = [n.time for n in self.nodes_by_airport[ap]]
-                idx = bisect.bisect_left(tlist, t)
-                self.nodes_by_airport[ap].insert(idx, node)
+                self.nodes_by_airport[ap].add(node)   # O(log n) SortedList insert
         print(f"  All nodes added: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
         # 3. Wait-arc chains
@@ -624,15 +652,12 @@ class CrewFlowNetwork:
     # ── Node refinement (DDD) ─────────────────
 
     def add_node(self, airport: str, time: int) -> Node:
-        import bisect
         node = Node(airport=airport, time=time)
         if node in self.nodes:
             return node
 
         self.nodes.add(node)
-        times = [n.time for n in self.nodes_by_airport[airport]]
-        idx = bisect.bisect_left(times, time)
-        self.nodes_by_airport[airport].insert(idx, node)
+        self.nodes_by_airport[airport].add(node)   # SortedList.add is O(log n)
 
         if self.model is not None:
             self._add_flow_constr_for_node(node)
@@ -643,10 +668,8 @@ class CrewFlowNetwork:
         return node
 
     def _rewire_wait_arcs(self, airport: str, new_node: Node):
-        import bisect
         nodes = self.nodes_by_airport[airport]
-        times = [n.time for n in nodes]
-        pos = bisect.bisect_left(times, new_node.time)
+        pos = nodes.index(new_node)          # O(log n) on SortedList
 
         prev_node = nodes[pos - 1] if pos > 0 else None
         next_node = nodes[pos + 1] if pos + 1 < len(nodes) else None
@@ -667,8 +690,9 @@ class CrewFlowNetwork:
 
     def _create_flight_arcs_from(self, node: Node):
         duty_so_far = self.min_duty_at.get(node, 0)
-        for f in self.flights:
-            if f.origin != node.airport or f.dep_min < node.time:
+        # Use pre-built index: only flights departing from this airport
+        for f in self._flights_from.get(node.airport, []):
+            if f.dep_min < node.time:
                 continue
             duty_after = duty_so_far + f.duration
             if duty_after > MAX_DUTY_MINUTES:
@@ -683,9 +707,8 @@ class CrewFlowNetwork:
                            f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
 
     def _create_flight_arcs_to(self, node: Node):
-        for f in self.flights:
-            if f.dest != node.airport:
-                continue
+        # Use pre-built index: only flights arriving at this airport
+        for f in self._flights_to.get(node.airport, []):
             dep_node = self._find_node(f.origin, f.dep_min)
             if dep_node is None or dep_node.time > f.dep_min:
                 continue
@@ -1051,6 +1074,11 @@ class CrewFlowNetwork:
         self.set_objective()
         self.model.setParam("MIPGap", 0.01)
         self.model.setParam("TimeLimit", 300)
+        self.model.setParam("Threads", 0)          # use all available cores
+        self.model.setParam("Method", 2)           # barrier LP — faster for network LPs
+        self.model.setParam("Presolve", 2)         # aggressive presolve
+        self.model.setParam("MIPFocus", 1)         # find good feasible solutions fast
+        self.model.setParam("Heuristics", 0.3)     # more MIP heuristics
         self.model.optimize()
 
         return self.extract_solution()
@@ -1216,30 +1244,40 @@ class CrewFlowNetwork:
         Greedy DFS from source to sink through residual flow graph.
         Returns list of arcs forming one unit-flow path, or None if none exists.
         Prefers flight > deadhead > wait arcs to produce meaningful pairings.
+
+        Uses a parent-pointer dict instead of copying the path list at every
+        stack push — O(path_length) reconstruction vs O(path_length²) before.
         """
         type_priority = {'flight': 0, 'deadhead': 1, 'wait': 2}
-        path = []
-        visited: set[Node] = set()
-        stack = [(source, [])]
+
+        # parent[node] = arc that led to node (None for source)
+        parent: dict[Node, Arc | None] = {source: None}
+        stack = [source]
 
         while stack:
-            node, current_path = stack.pop()
-            if node in visited:
-                continue
-            visited.add(node)
+            node = stack.pop()
 
             if node == sink:
-                return current_path
+                # Reconstruct path by walking parent pointers back to source
+                path: list[Arc] = []
+                cur = sink
+                while parent[cur] is not None:
+                    arc = parent[cur]
+                    path.append(arc)
+                    cur = arc.start
+                path.reverse()
+                return path
 
-            # Candidate arcs with remaining flow, sorted by preference
             candidates = [
                 a for a in self.arcs_from.get(node, [])
-                if residual.get(a, 0) > 0 and a.end not in visited
+                if residual.get(a, 0) > 0 and a.end not in parent
             ]
+            # Sort ascending so that reversed push order puts best arc on top
             candidates.sort(key=lambda a: (type_priority.get(a.arc_type, 9), a.end.time))
 
-            for arc in reversed(candidates):  # reversed so best goes on top of stack
-                stack.append((arc.end, current_path + [arc]))
+            for arc in reversed(candidates):
+                parent[arc.end] = arc
+                stack.append(arc.end)
 
         return None
 
