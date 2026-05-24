@@ -28,6 +28,26 @@ Stage 2 (roster assignment):
   - Assign named crew IDs to routes by base via flow decomposition
   - Each crew member gets one route starting and ending at their home base
 
+Rolling Horizon:
+  - ROLLING_HORIZON = True enables a sliding-window solve instead of one
+    monolithic 30-day MIP.
+  - The horizon is divided into windows of WINDOW_DAYS days, advancing by
+    STEP_DAYS each iteration (overlap = WINDOW_DAYS - STEP_DAYS).
+  - At each step:
+      1. Solve only the current window (+ RETURN_WINDOW tail for return arcs).
+      2. Fix the crew positions at the end of STEP_DAYS as the warm-start
+         supply vector for the next window ("state hand-off").
+      3. Append the window's routes to the global result.
+  - Why rolling horizon for a month?
+      * A 30-day monolithic MIP has O(30×daily_arcs) variables — typically
+        10–50× more than a 3-day window — and B&B scales super-linearly.
+      * Rolling horizon gives near-optimal solutions in a fraction of the time,
+        at the cost of a small boundary effect (crew positions are fixed, not
+        re-optimised across the cut point).
+      * The overlap (WINDOW_DAYS - STEP_DAYS) lets the solver "look ahead"
+        past the commit horizon so boundary flights aren't systematically
+        under-staffed.
+
 Key advantages over individual-variable formulation:
   - Variables: O(|arcs|) instead of O(|crew| × |arcs|)
   - Constraints: O(|nodes|) instead of O(|crew| × |nodes|)
@@ -36,7 +56,8 @@ Key advantages over individual-variable formulation:
 
 Data:
   - flights_enriched.csv (BTS On-Time + FAA registry join)
-  - Uses first 3 days; bases chosen by weighted k-median + satellite pre-positioning
+  - Uses first DAYS_TO_SOLVE days; bases chosen by weighted k-median +
+    satellite pre-positioning
 """
 
 from __future__ import annotations
@@ -62,6 +83,13 @@ TIME_BUCKET        = 15
 MIN_TURNAROUND     = 45
 MIN_REST           = 8 * 60
 OVERNIGHT_THRESHOLD = 4 * 60
+
+# ── Rolling horizon ───────────────────────────
+# Set True to solve day-by-day windows instead of one monolithic MIP.
+# Recommended for DAYS_TO_SOLVE >= 14.
+ROLLING_HORIZON    = True
+WINDOW_DAYS        = 7        # planning window per solve (days)
+STEP_DAYS          = 3        # days committed per step (< WINDOW_DAYS for overlap)
 
 # ── Base selection strategy ───────────────────
 # 'volume'   : legacy — top-N airports by departure count (poor geographic coverage)
@@ -152,14 +180,69 @@ def parse_hhmm(s: str) -> int:
     s = s.strip().zfill(4)
     return int(s[:2]) * 60 + int(s[2:])
 
-def parse_flights(filepath: str, days: int, horizon_days: int | None = None) -> tuple[list[Flight], datetime]:
+
+def _find_week_start(filepath: str) -> datetime:
+    """
+    Two-pass helper: scan the entire CSV to find the true minimum FL_DATE.
+
+    FIX: the original code set week_start from the first row encountered,
+    which may not be chronologically first (CSV is sorted by carrier, not
+    date). Any flight before that row got day_offset < 0 and was silently
+    dropped, causing the 'nothing after day N' symptom.
+    """
+    date_fmt_options = ["%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d", "%m/%d/%Y"]
+    min_date = None
+
+    with open(filepath, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fl_date_str = row.get('FL_DATE', '').strip()
+            fl_date = None
+            for fmt in date_fmt_options:
+                try:
+                    fl_date = datetime.strptime(fl_date_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if fl_date is None:
+                continue
+            if min_date is None or fl_date < min_date:
+                min_date = fl_date
+
+    if min_date is None:
+        raise ValueError("No valid FL_DATE values found in CSV.")
+
+    return datetime(min_date.year, min_date.month, min_date.day)
+
+
+def parse_flights(
+    filepath: str,
+    days: int,
+    horizon_days: int | None = None,
+    week_start: datetime | None = None,
+) -> tuple[list[Flight], datetime]:
+    """
+    Parse flights from CSV.
+
+    Parameters
+    ----------
+    filepath     : path to flights_enriched.csv
+    days         : number of days that need crew coverage (needs_coverage=True)
+    horizon_days : total days to load (>= days; extra tail used for return arcs)
+    week_start   : anchor date; if None, determined by scanning the full CSV
+                   for the minimum FL_DATE (two-pass read — fixes the
+                   first-row-wins bug in the original code).
+    """
     if horizon_days is None:
         horizon_days = days
 
+    # ── Determine anchor date ─────────────────────────────────────────────────
+    if week_start is None:
+        week_start = _find_week_start(filepath)
+
+    date_fmt_options = ["%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d", "%m/%d/%Y"]
     flights = []
     fid = 0
-    week_start = None
-    date_fmt_options = ["%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d", "%m/%d/%Y"]
 
     with open(filepath, encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -180,9 +263,6 @@ def parse_flights(filepath: str, days: int, horizon_days: int | None = None) -> 
                     continue
             if fl_date is None:
                 continue
-
-            if week_start is None:
-                week_start = datetime(fl_date.year, fl_date.month, fl_date.day)
 
             day_offset = (fl_date - week_start.date()).days
             if day_offset >= horizon_days or day_offset < 0:
@@ -227,7 +307,7 @@ def parse_flights(filepath: str, days: int, horizon_days: int | None = None) -> 
             flights.append(flight)
             fid += 1
 
-    if week_start is None:
+    if not flights:
         raise ValueError("No valid flights found in CSV.")
 
     n_cov  = sum(1 for f in flights if getattr(f, 'needs_coverage', True))
@@ -728,16 +808,39 @@ def _dijkstra_worker(args: tuple) -> tuple[set[int], set[int]]:
     """
     Process-pool worker: forward + backward Dijkstra for one base.
 
-    args: (fwd_start_id, bwd_start_id)
+    args: (fwd_start_ids, bwd_start_id)
+      fwd_start_ids : list of node ids where crew may start (home or displaced)
+      bwd_start_id  : single horizon node id for backward pass
     Returns (fwd_reachable_arc_ids, bwd_reachable_arc_ids).
     """
     import heapq
-    fwd_start, bwd_start = args
+    fwd_starts, bwd_start = args
     graph   = _WORKER_FWD_GRAPH
     bgraph  = _WORKER_BWD_GRAPH
     horizon = _WORKER_HORIZON
 
-    def _run(start_id: int, g: dict) -> set[int]:
+    def _run_fwd(start_ids: list, g: dict) -> set[int]:
+        # Multi-source forward Dijkstra: crew may start from any position node.
+        earliest: dict[int, int] = {sid: 0 for sid in start_ids}
+        heap = [(0, sid) for sid in start_ids]
+        import heapq as _hq
+        _hq.heapify(heap)
+        reached: set[int] = set()
+        while heap:
+            t, nid = _hq.heappop(heap)
+            if t > earliest.get(nid, horizon + 1):
+                continue
+            for eid, arr, arc_id, arc_start_t in g.get(nid, []):
+                if arr > horizon:
+                    continue
+                if t <= arc_start_t:
+                    reached.add(arc_id)
+                if arr < earliest.get(eid, horizon + 1):
+                    earliest[eid] = arr
+                    _hq.heappush(heap, (arr, eid))
+        return reached
+
+    def _run_bwd(start_id: int, g: dict) -> set[int]:
         earliest: dict[int, int] = {start_id: 0}
         heap = [(0, start_id)]
         reached: set[int] = set()
@@ -755,7 +858,7 @@ def _dijkstra_worker(args: tuple) -> tuple[set[int], set[int]]:
                     heapq.heappush(heap, (arr, eid))
         return reached
 
-    return _run(fwd_start, graph), _run(bwd_start, bgraph)
+    return _run_fwd(fwd_starts, graph), _run_bwd(bwd_start, bgraph)
 
 
 class CrewFlowNetwork:
@@ -782,6 +885,11 @@ class CrewFlowNetwork:
       f_work[flight_arc] + slack[flt] >= flt.min_crew
 
     After solving, Stage 2 flow decomposition assigns named crew IDs.
+
+    Rolling horizon usage:
+      Pass window_offset > 0 to shift all node times by that many minutes.
+      Pass base_supply_override to replace default crew counts (used after
+      the first window to reflect actual crew positions at the cut point).
     """
 
     def __init__(
@@ -792,7 +900,19 @@ class CrewFlowNetwork:
         flight_end: int | None = None,
         time_bucket: int = TIME_BUCKET,
         verbose: bool = True,
+        window_offset: int = 0,
+        base_supply_override: dict[str, int] | None = None,
+        position_supply: dict[str, dict[str, int]] | None = None,
     ):
+        """
+        Parameters
+        ----------
+        position_supply : {home_base: {airport: count}}
+            If provided (rolling horizon windows 2+), crew from each home_base
+            start distributed across airports as given, rather than all at home.
+            Supersedes base_supply_override.
+        base_supply_override : {home_base: total_count}   (legacy, kept for compat)
+        """
         self.flights = flights
         self.flights_by_id = {f.id: f for f in flights}
         self.crew = crew
@@ -801,12 +921,28 @@ class CrewFlowNetwork:
         self.base_crew: dict[str, int] = defaultdict(int)
         for c in crew:
             self.base_crew[c.base] += 1
+
+        # Rolling horizon: override supply with actual end-of-step positions.
+        # position_supply takes precedence; base_supply_override is a fallback.
+        if base_supply_override and not position_supply:
+            for base, count in base_supply_override.items():
+                self.base_crew[base] = count
+
+        # {home_base: {airport: count}} — where crew actually are at window start.
+        # None means "all crew are at home base" (first window).
+        self.position_supply: dict[str, dict[str, int]] | None = position_supply
+
         self.airports = sorted(self.base_crew.keys())
 
-        self.horizon_end = horizon_end
-        self.flight_end  = flight_end if flight_end is not None else horizon_end
-        self.time_bucket = time_bucket
-        self.verbose     = verbose
+        self.horizon_end    = horizon_end
+        self.flight_end     = flight_end if flight_end is not None else horizon_end
+        self.time_bucket    = time_bucket
+        self.verbose        = verbose
+        self.window_offset  = window_offset   # minutes offset for this window
+        # True only for the final rolling-horizon window (or monolithic solve).
+        # Intermediate windows use free-exit flow balance so crew aren't forced
+        # back to their home base at the commit cut-point.
+        self.is_last_window: bool = True
 
         # Network topology
         self.nodes:             set[Node]                       = set()
@@ -971,14 +1107,33 @@ class CrewFlowNetwork:
         fwd_plain = dict(fwd_graph)
         bwd_plain = dict(bwd_graph)
 
-        task_args:  list[tuple[int, int]] = []
+        task_args:  list[tuple[list[int], int]] = []
         base_order: list[str] = []
         for base in self.airports:
-            depot_id   = node_to_id.get(Node(airport=base, time=DEPOT_TIME_START))
             horizon_id = node_to_id.get(Node(airport=base, time=horizon))
-            if depot_id is None or horizon_id is None:
+            if horizon_id is None:
                 continue
-            task_args.append((depot_id, horizon_id))
+
+            # Forward sources: wherever crew from this base actually start.
+            if self.position_supply and base in self.position_supply:
+                fwd_ids = [
+                    node_to_id[Node(airport=ap, time=DEPOT_TIME_START)]
+                    for ap, count in self.position_supply[base].items()
+                    if count > 0
+                    and Node(airport=ap, time=DEPOT_TIME_START) in node_to_id
+                ]
+            else:
+                fwd_ids = []
+
+            # Always include the home depot as a fallback source.
+            home_depot_id = node_to_id.get(Node(airport=base, time=DEPOT_TIME_START))
+            if home_depot_id is not None and home_depot_id not in fwd_ids:
+                fwd_ids.append(home_depot_id)
+
+            if not fwd_ids:
+                continue
+
+            task_args.append((fwd_ids, horizon_id))
             base_order.append(base)
 
         n_workers = min(len(base_order), os.cpu_count() or 4)
@@ -1019,12 +1174,24 @@ class CrewFlowNetwork:
         print("Building network...")
         t0 = _t.time()
 
-        # 1. Depot + horizon nodes for each base
+        # 1. Depot + horizon nodes for each base, plus position nodes for
+        #    any non-home airport where crew actually start this window.
         for ap in self.airports:
             for t in (DEPOT_TIME_START, self.horizon_end):
                 node = Node(airport=ap, time=t)
                 self.nodes.add(node)
                 self.nodes_by_airport[ap].add(node)
+
+        if self.position_supply:
+            for base, airport_counts in self.position_supply.items():
+                for ap, count in airport_counts.items():
+                    if count > 0 and ap not in self.airports:
+                        # Non-base airport: add a depot-time node so we can
+                        # inject supply there.
+                        node = Node(airport=ap, time=DEPOT_TIME_START)
+                        self.nodes.add(node)
+                        self.nodes_by_airport[ap].add(node)
+
         print(f"  Depot/horizon nodes: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
         # 2. One node per exact flight dep/arr time — network is fully
@@ -1251,26 +1418,79 @@ class CrewFlowNetwork:
 
         for base in self.airports:
             supply  = self.base_crew[base]
-            depot   = Node(airport=base, time=DEPOT_TIME_START)
             horizon = Node(airport=base, time=self.horizon_end)
             self.flow_constrs[base] = {}
 
             outs = out_terms[base]
             ins  = in_terms[base]
 
+            # Build per-node supply injection map.
+            # First window (no position info): all crew start at home base.
+            # Subsequent windows: crew start wherever they actually ended up.
+            node_supply: dict[Node, int] = {}
+            if self.position_supply and base in self.position_supply:
+                for ap, count in self.position_supply[base].items():
+                    if count > 0:
+                        node_supply[Node(airport=ap, time=DEPOT_TIME_START)] = count
+                # Sanity: total injected must equal total crew for this base.
+                injected = sum(node_supply.values())
+                if injected != supply:
+                    # Absorb rounding difference at home base.
+                    home_depot = Node(airport=base, time=DEPOT_TIME_START)
+                    node_supply[home_depot] = node_supply.get(home_depot, 0) + (supply - injected)
+            else:
+                node_supply[Node(airport=base, time=DEPOT_TIME_START)] = supply
+
+            # ── Fix 2: validate injected supply nodes have outbound flow ─────
+            # If a non-home node carries supply but has no outbound variables
+            # (e.g. satellite airport with no arcs in this window), the flow
+            # balance constraint would be infeasible or vacuous.  Redistribute
+            # any such orphaned supply to the home depot.
+            home_depot = Node(airport=base, time=DEPOT_TIME_START)
+            orphaned = 0
+            for node in list(node_supply.keys()):
+                if node == home_depot:
+                    continue
+                if not outs.get(node):
+                    orphaned += node_supply.pop(node)
+            if orphaned:
+                node_supply[home_depot] = node_supply.get(home_depot, 0) + orphaned
+                print(f"  WARNING [{base}]: {orphaned} crew unit(s) injected at "
+                      f"unreachable airport(s) — redistributed to home depot")
+
             for node in node_list:
                 out_expr = gp.quicksum(outs.get(node, []))
                 in_expr  = gp.quicksum(ins.get(node, []))
 
-                if node == depot:
-                    constr = self.model.addConstr(
-                        out_expr - in_expr == supply,
-                        name=f"flow_{base}_{node.airport}_{node.time}_depot"
-                    )
-                elif node == horizon:
+                inj = node_supply.get(node, 0)
+                if node == horizon and self.is_last_window:
+                    # Final window: all crew must return to home base.
                     constr = self.model.addConstr(
                         in_expr - out_expr == supply,
                         name=f"flow_{base}_{node.airport}_{node.time}_horizon"
+                    )
+                elif node == horizon:
+                    # Intermediate window: horizon node is a free-exit sink.
+                    # Flow arrives here from crew finishing their last leg;
+                    # there are no outgoing arcs so we just need in >= out (>= 0)
+                    # rather than == 0 which would block all arriving flow.
+                    constr = self.model.addConstr(
+                        in_expr - out_expr >= 0,
+                        name=f"flow_{base}_{node.airport}_{node.time}_horizon"
+                    )
+                elif inj != 0:
+                    constr = self.model.addConstr(
+                        out_expr - in_expr == inj,
+                        name=f"flow_{base}_{node.airport}_{node.time}_depot"
+                    )
+                elif not self.is_last_window and node.time >= self.flight_end:
+                    # Intermediate window: any node at or after the commit cut
+                    # is a free-exit point — crew whose last committed leg ends
+                    # here stop and wait for the next window to pick them up.
+                    # One-sided bound only; MIP lb=0 prevents phantom flow.
+                    constr = self.model.addConstr(
+                        out_expr - in_expr <= 0,
+                        name=f"flow_{base}_{node.airport}_{node.time}_exit"
                     )
                 else:
                     constr = self.model.addConstr(
@@ -1320,10 +1540,17 @@ class CrewFlowNetwork:
 
     # ── Solve ─────────────────────────────────
 
-    def solve(self) -> dict:
+    def solve(self, crew_positions: dict[int, str] | None = None) -> dict:
         """
         Solve directly as MIP. No iterative refinement needed — the network
         already has a node at every exact flight departure and arrival time.
+
+        Parameters
+        ----------
+        crew_positions : {crew_id: airport}
+            Where each crew member starts this window (from previous window's
+            end positions).  Forwarded to _decompose_routes for identity-preserving
+            route assignment.
         """
         print("\n=== Solving MIP ===")
         self._ensure_attrs()
@@ -1335,9 +1562,15 @@ class CrewFlowNetwork:
         for var in self.slack_var.values():
             var.VType = GRB.INTEGER
 
+        dh_cost_map: dict[int, float] = {
+            f.id: deadhead_cost(f) for f in self.flights
+        }
         obj = (
             gp.quicksum(arc.cost * v for (base, arc), v in self.var_work.items())
-            + gp.quicksum(arc.cost * v for (base, arc), v in self.var_dh.items())
+            + gp.quicksum(
+                dh_cost_map.get(arc.flight_id, arc.cost) * v
+                for (base, arc), v in self.var_dh.items()
+            )
             + gp.quicksum(arc.cost * v for (base, arc), v in self.var_wait.items())
             + gp.quicksum(COST_UNCOVERED * v for v in self.slack_var.values())
         )
@@ -1345,31 +1578,29 @@ class CrewFlowNetwork:
 
         self.model.setParam("OutputFlag", 1)
         self.model.setParam("MIPGap", 0.01)
-        # self.model.setParam("Threads", 0)          # all cores for presolve + B&B
         self.model.setParam("Method", 2)
         self.model.setParam("Presolve", 2)
         self.model.setParam("MIPFocus", 1)
         self.model.setParam("Heuristics", 0.3)
-        self.model.setParam("DisplayInterval", 30)   # print every 30s
-        self.model.setParam("TimeLimit", 7200)        # 2hr wall clock; takes best incumbent
-        # self.model.setParam("CutPasses", 3)           # max 3 cut rounds at root (default: unlimited)
-        self.model.setParam("Cuts", 1)                # moderate cuts — aggressive causes degeneracy on network flow
-        self.model.setParam("GomoryPasses", 0)        # disable Gomory cuts — main culprit for stuck node 0
-        # self.model.setParam("NodeMethod", 1)          # dual simplex at B&B nodes — faster for network structure
+        self.model.setParam("DisplayInterval", 30)
+        self.model.setParam("TimeLimit", 7200)
+        self.model.setParam("Cuts", 1)
+        self.model.setParam("GomoryPasses", 0)
         self.model.setParam("Crossover", 1)
         self.model.setParam("NodefileStart", 4)
         self.model.setParam("Threads", 8)
         self.model.optimize()
 
-        return self.extract_solution()
+        return self.extract_solution(crew_positions=crew_positions)
 
     # ── Solution extraction ───────────────────
 
-    def extract_solution(self) -> dict:
+    def extract_solution(self, crew_positions: dict[int, str] | None = None) -> dict:
         eps = 1e-4
         if self.model.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL):
             return {"status": "infeasible", "cost": None, "routes": [],
-                    "uncovered_flights": [], "uncovered_slots": 0}
+                    "uncovered_flights": [], "uncovered_slots": 0,
+                    "end_positions": {}}
 
         obj = self.model.ObjVal
 
@@ -1399,7 +1630,22 @@ class CrewFlowNetwork:
         wait_cost = sum(arc.cost * v.X
                         for (base, arc), v in self.var_wait.items() if v.X > eps)
 
-        routes = self._decompose_routes()
+        routes, next_crew_positions = self._decompose_routes(
+            crew_positions=crew_positions,
+        )
+
+        # ── Rolling horizon: derive end positions from the per-crew position
+        # map (single source of truth).  _extract_end_positions() used a
+        # separate arc-straddle counter that could disagree with
+        # _decompose_routes when a crew member was mid-flight at the commit
+        # cut, causing phantom teleports in the next window.
+        base_map = {c.id: c.base for c in self.crew}
+        end_positions: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for cid, airport in next_crew_positions.items():
+            home = base_map.get(cid)
+            if home:
+                end_positions[home][airport] += 1
+        end_positions = {k: dict(v) for k, v in end_positions.items()}
 
         return {
             "status": "optimal" if self.model.Status == GRB.OPTIMAL else "suboptimal",
@@ -1412,23 +1658,70 @@ class CrewFlowNetwork:
             "uncovered_slots": sum(v for _, v in uncovered),
             "uncovered_flights": uncovered,
             "routes": routes,
+            "crew_positions": next_crew_positions,
+            "end_positions": end_positions,
             "num_flights": len([f for f in self.flights
                                  if getattr(f, 'needs_coverage', True)]),
             "covered_flights": len([f for f in self.flights
                                      if getattr(f, 'needs_coverage', True)]) - len(uncovered),
         }
 
+    def _extract_end_positions(self) -> dict[str, dict[str, int]]:
+        """
+        For rolling horizon: determine how many crew from each home base are
+        at each airport at t = flight_end (the commit cut-point).
+
+        Returns {airport: {home_base: count}} so the next window can use the
+        actual airport as the new depot, rather than assuming everyone is home.
+
+        The commit point is flight_end (= step_days * 1440 in absolute time).
+        We look at the flow on arcs that straddle or terminate at that time.
+        """
+        eps = 1e-4
+        commit_t = self.flight_end
+        # {(airport, home_base): count}
+        positions: dict[tuple[str, str], int] = defaultdict(int)
+
+        for (base, arc), var in {**self.var_work, **self.var_dh, **self.var_wait}.items():
+            val = round(var.X) if var.X > eps else 0
+            if val <= 0:
+                continue
+            # Crew on this arc are in-transit at commit_t if they departed before
+            # and arrive after — treat them as being at arc.start.airport.
+            # Crew who have finished this arc by commit_t are at arc.end.airport.
+            if arc.start.time <= commit_t <= arc.true_end:
+                positions[(arc.start.airport, base)] += val
+            elif arc.true_end <= commit_t and arc.end.time >= commit_t:
+                positions[(arc.end.airport, base)] += val
+
+        # Reshape to {home_base: {airport: count}} — the shape position_supply expects.
+        result: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for (airport, home_base), count in positions.items():
+            result[home_base][airport] += count
+
+        return {k: dict(v) for k, v in result.items()}
+
     # ── Stage 2: flow decomposition ───────────
 
-    def _decompose_routes(self) -> list[dict]:
+    def _decompose_routes(
+        self,
+        crew_positions: dict[int, str] | None = None,
+    ) -> tuple[list[dict], dict[int, str]]:
         """
         Decompose integer arc flows into individual crew routes.
 
-        For each base b:
-          Build a residual flow graph with integer capacities from solution.
-          Repeatedly trace paths from depot(b) to horizon(b), each consuming
-          1 unit of flow. Each path becomes one crew member's route.
-          Assign named crew IDs from this base's crew pool.
+        Parameters
+        ----------
+        crew_positions : {crew_id: airport}
+            Where each crew member is at the start of this window
+            (i.e. where they ended in the previous window).  None means all
+            crew start at their home base (first window).
+
+        Returns
+        -------
+        (routes, next_crew_positions)
+            next_crew_positions is {crew_id: airport} at the end of each
+            route's last leg — handed to the next window.
         """
         residual: dict[tuple[str, Arc], int] = {}
         for (base, arc), var in self.var_work.items():
@@ -1450,24 +1743,71 @@ class CrewFlowNetwork:
                 arc_is_work_for_base.add((base, arc.id))
 
         routes = []
+        # Seed next_crew_positions with incoming positions for ALL crew.
+        # Crew who fly this window will overwrite their entry with their new
+        # last-leg destination.  Crew who sit idle retain their current position
+        # (or home base on the first window) — they don't teleport home.
+        if crew_positions is not None:
+            next_crew_positions: dict[int, str] = dict(crew_positions)
+        else:
+            # First window: everyone starts at home.
+            next_crew_positions = {c.id: c.base for c in self.crew}
 
         for base in self.airports:
-            depot   = Node(airport=base, time=DEPOT_TIME_START)
             horizon = Node(airport=base, time=self.horizon_end)
             supply  = self.base_crew[base]
 
             base_crew_ids = [c.id for c in self.crew if c.base == base]
-            crew_idx = 0
 
             base_residual: dict[Arc, int] = {}
             for (b, arc), cap in residual.items():
                 if b == base and cap > 0:
                     base_residual[arc] = base_residual.get(arc, 0) + cap
 
-            for _ in range(supply):
-                path_arcs = self._trace_path(depot, horizon, base_residual)
+            # Build the ordered list of (crew_id, source_node) pairs.
+            # Each crew member departs from wherever they currently are.
+            home = Node(airport=base, time=DEPOT_TIME_START)
+            ordered: list[tuple[int, Node]] = [
+                (cid, Node(airport=next_crew_positions.get(cid, base),
+                           time=DEPOT_TIME_START))
+                for cid in base_crew_ids
+            ]
+
+            # Sort so crew whose starting airport has the least available flow
+            # are traced first — they're most at risk of losing their path.
+            def _depot_flow(depot: Node) -> int:
+                return sum(
+                    cap for arc, cap in base_residual.items()
+                    if arc.start == depot
+                )
+            ordered.sort(key=lambda pair: _depot_flow(pair[1]))
+
+            # Intermediate windows: accept any node at/after the commit cut as
+            # a valid path terminal (crew park wherever their last leg lands).
+            # Last window: must reach the home-base horizon node exactly.
+            exit_cutoff = self.flight_end if not self.is_last_window else None
+
+            for crew_id, depot in ordered:
+                prior_airport = next_crew_positions.get(crew_id, base)
+                path_arcs = self._trace_path(depot, horizon, base_residual,
+                                             exit_cutoff=exit_cutoff)
+                if not path_arcs and depot != home:
+                    # Flow from this crew's position was already consumed —
+                    # fall back to home so they still get a route this window.
+                    # NOTE: this is a phantom move if the prior position ≠ home;
+                    # we log it so the caller can audit cross-window continuity.
+                    if prior_airport != base:
+                        print(
+                            f"  WARNING: crew {crew_id} (base {base}) fallback to "
+                            f"home — position gap: was at {prior_airport}, "
+                            f"no flow found there; starting from {base} instead."
+                        )
+                    path_arcs = self._trace_path(home, horizon, base_residual,
+                                                 exit_cutoff=exit_cutoff)
                 if not path_arcs:
-                    break
+                    # Truly no flow left for this crew member this window.
+                    # They stay wherever next_crew_positions already has them.
+                    continue
 
                 for arc in path_arcs:
                     base_residual[arc] -= 1
@@ -1488,37 +1828,48 @@ class CrewFlowNetwork:
                         "flight_id": arc.flight_id,
                     })
 
-                if legs and crew_idx < len(base_crew_ids):
+                if legs:
                     routes.append({
-                        "crew_id":    base_crew_ids[crew_idx],
+                        "crew_id":    crew_id,
                         "base":       base,
                         "crew_count": 1,
                         "legs":       legs,
                     })
-                    crew_idx += 1
+                    # Update this crew member's position to their last leg destination.
+                    next_crew_positions[crew_id] = legs[-1]["to"]
 
-        return routes
+        return routes, next_crew_positions
 
     def _trace_path(
         self,
         source: Node,
         sink: Node,
         residual: dict[Arc, int],
+        exit_cutoff: int | None = None,
     ) -> list[Arc] | None:
         """
-        Greedy DFS from source to sink through residual flow graph.
-        Returns list of arcs forming one unit-flow path, or None if none exists.
+        Greedy DFS from source to sink (or any node at/after exit_cutoff) through
+        residual flow graph.  Returns list of arcs forming one unit-flow path,
+        or None if none found.
+
+        exit_cutoff : if set (intermediate windows), any node whose time >=
+            exit_cutoff is a valid terminal — crew don't need to return to the
+            home-base horizon node yet.  The explicit sink is still checked first
+            so last-window behaviour is unchanged.
         Prefers flight > deadhead > wait arcs for meaningful pairings.
         """
         type_priority = {'flight': 0, 'deadhead': 1, 'wait': 2}
 
         parent: dict[Node, Arc | None] = {source: None}
+        # Track the best terminal node found (latest time at/after cutoff)
+        best_terminal: Node | None = None
         stack = [source]
 
         while stack:
             node = stack.pop()
 
             if node == sink:
+                # Exact horizon match — reconstruct immediately.
                 path: list[Arc] = []
                 cur = sink
                 while parent[cur] is not None:
@@ -1527,6 +1878,12 @@ class CrewFlowNetwork:
                     cur = arc.start
                 path.reverse()
                 return path
+
+            if exit_cutoff is not None and node.time >= exit_cutoff and node != source:
+                # Valid free-exit terminal: record the one with the latest time
+                # (deepest into the window) so we commit the most work.
+                if best_terminal is None or node.time > best_terminal.time:
+                    best_terminal = node
 
             candidates = [
                 a for a in self.arcs_from.get(node, [])
@@ -1538,23 +1895,350 @@ class CrewFlowNetwork:
                 parent[arc.end] = arc
                 stack.append(arc.end)
 
+        # No path to exact sink — if a free-exit terminal was found, use it.
+        if best_terminal is not None:
+            path: list[Arc] = []
+            cur = best_terminal
+            while parent[cur] is not None:
+                arc = parent[cur]
+                path.append(arc)
+                cur = arc.start
+            path.reverse()
+            return path
+
         return None
+
+
+# ─────────────────────────────────────────────
+# ROLLING HORIZON DRIVER
+# ─────────────────────────────────────────────
+
+def _slice_flights_for_window(
+    all_flights: list[Flight],
+    win_start_min: int,
+    win_end_min: int,      # commit point (= step end)
+    horizon_end_min: int,  # return tail end
+) -> list[Flight]:
+    """
+    Return flights that fall within [win_start_min, horizon_end_min).
+    dep_min and arr_min are already absolute (minutes from day 0 of dataset).
+    needs_coverage is True iff dep_min < win_end_min.
+    """
+    result = []
+    for f in all_flights:
+        if f.dep_min >= horizon_end_min or f.arr_min <= win_start_min:
+            continue
+        # Shift times so window starts at t=0
+        shifted = Flight(
+            id=f.id,
+            origin=f.origin,
+            dest=f.dest,
+            dep_min=f.dep_min - win_start_min,
+            arr_min=f.arr_min - win_start_min,
+            duration=f.duration,
+            min_crew=f.min_crew,
+            flight_num=f.flight_num,
+            distance=f.distance,
+            seats=f.seats,
+        )
+        needs_cov = f.dep_min < win_end_min
+        object.__setattr__(shifted, 'needs_coverage', needs_cov)
+        result.append(shifted)
+    return result
+
+
+def _build_supply_from_positions(
+    end_positions: dict[str, dict[str, int]],
+    home_base: str,
+    airports: list[str],
+) -> dict[str, int]:
+    """
+    Convert the end_positions map from the previous window into a supply
+    vector for the next window.
+
+    For a given home_base, total crew at each airport = how many crew
+    from that home base are there.  This becomes the new supply so the
+    MIP correctly starts crew where they actually are.
+    """
+    supply: dict[str, int] = defaultdict(int)
+    for airport, base_counts in end_positions.items():
+        count = base_counts.get(home_base, 0)
+        if count > 0 and airport in airports:
+            supply[airport] += count
+    return dict(supply)
+
+
+def solve_rolling_horizon(
+    all_flights: list[Flight],
+    crew: list[CrewMember],
+    days: int,
+    window_days: int = WINDOW_DAYS,
+    step_days: int = STEP_DAYS,
+    return_window: int = RETURN_WINDOW,
+    verbose: bool = True,
+) -> dict:
+    """
+    Solve a long planning horizon by rolling a shorter solve window forward.
+
+    Parameters
+    ----------
+    all_flights   : full set of flights (absolute dep/arr times from day 0)
+    crew          : crew list (from assign_crew_bases on the full horizon)
+    days          : total days to plan (DAYS_TO_SOLVE)
+    window_days   : length of each solve window in days
+    step_days     : days committed per step (overlap = window_days - step_days)
+    return_window : tail days appended for return-arc feasibility
+    verbose       : print progress
+
+    Returns
+    -------
+    Aggregated result dict compatible with save_result / the visualiser.
+    """
+    import time as _t
+
+    airports = sorted(set(c.base for c in crew))
+    total_min = days * 1440
+    window_min = window_days * 1440
+    step_min   = step_days * 1440
+    tail_min   = return_window * 1440
+
+    all_routes: list[dict] = []
+    all_uncovered: list[tuple] = []
+    total_cost = 0.0
+    total_flight_cost = 0.0
+    total_dh_cost = 0.0
+    total_wait_cost = 0.0
+    total_uncovered_slots = 0.0
+    covered_count = 0
+    flight_count = 0
+
+    # {crew_id: airport} — where each crew member ends each window, so the next
+    # window can start each crew from their actual location and preserve identity.
+    # Also used to derive position_supply so both sources are always consistent.
+    crew_positions: dict[int, str] | None = None
+
+    step = 0
+    win_start = 0
+    while win_start < total_min:
+        win_commit = min(win_start + step_min, total_min)
+        win_horizon = min(win_start + window_min + tail_min, total_min + tail_min)
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"ROLLING WINDOW {step+1}  |  "
+                  f"days {win_start//1440+1}–{win_commit//1440}  "
+                  f"(solve horizon: day {win_horizon//1440})")
+            print(f"{'='*60}")
+
+        # ── Slice flights for this window ─────────────────────────────────────
+        win_flights = _slice_flights_for_window(
+            all_flights,
+            win_start_min=win_start,
+            win_end_min=win_commit,
+            horizon_end_min=win_horizon,
+        )
+
+        if not win_flights:
+            if verbose:
+                print("  No flights in this window — skipping.")
+            win_start += step_min
+            step += 1
+            continue
+
+        # ── Build position_supply from crew_positions (single source of truth) ──
+        # Derive {home_base: {airport: count}} directly from the per-crew
+        # endpoint map so the flow supply and route decomposition are always
+        # consistent — no separate _extract_end_positions needed here.
+        if crew_positions is not None:
+            win_position_supply: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            base_map = {c.id: c.base for c in crew}
+            for cid, airport in crew_positions.items():
+                home = base_map.get(cid)
+                if home:
+                    win_position_supply[home][airport] += 1
+            win_position_supply = {k: dict(v) for k, v in win_position_supply.items()}
+        else:
+            win_position_supply = None
+
+        # ── Fix 3c: assert supply totals match crew counts ────────────────────
+        # If the position map is set, every base must inject exactly the right
+        # number of crew units — any mismatch means the prior window's position
+        # tracker and the crew roster have diverged.
+        if win_position_supply is not None:
+            base_crew_counts = defaultdict(int)
+            for c in crew:
+                base_crew_counts[c.base] += 1
+            for base, airport_counts in win_position_supply.items():
+                injected = sum(airport_counts.values())
+                expected = base_crew_counts.get(base, 0)
+                if injected != expected:
+                    print(
+                        f"  WARNING [window {step+1}]: supply mismatch for base "
+                        f"{base}: position map injects {injected} but roster "
+                        f"has {expected}. Correcting."
+                    )
+                    # Absorb the difference at the home depot entry.
+                    diff = expected - injected
+                    win_position_supply[base][base] = (
+                        win_position_supply[base].get(base, 0) + diff
+                    )
+
+        # ── Build and solve the window network ────────────────────────────────
+        win_horizon_local = win_horizon - win_start   # time in window-local minutes
+        win_commit_local  = win_commit  - win_start
+
+        is_last = (win_commit >= total_min)
+        net = CrewFlowNetwork(
+            flights=win_flights,
+            crew=crew,
+            horizon_end=win_horizon_local,
+            flight_end=win_commit_local,
+            time_bucket=TIME_BUCKET,
+            verbose=verbose,
+            window_offset=win_start,
+            position_supply=win_position_supply,
+        )
+        net.is_last_window = is_last
+        net.build_initial_network()
+        net.build_model()
+        result = net.solve(crew_positions=crew_positions)
+
+        t_solve = _t.time()
+
+        status = result.get("status", "unknown")
+        if verbose:
+            print(f"  Window status : {status}")
+            cost_val = result.get('cost') or 0.0
+            print(f"  Window cost   : {cost_val:,.1f}")
+            print(f"  Flights in window     : {result.get('num_flights', 0)}")
+            print(f"  Covered               : {result.get('covered_flights', 0)}")
+            print(f"  Uncovered slots       : {result.get('uncovered_slots', 0):.1f}")
+
+        # ── Translate routes back to absolute time ────────────────────────────
+        win_abs_routes = []
+        for route in result.get("routes", []):
+            abs_route = dict(route)
+            abs_legs = []
+            for leg in route["legs"]:
+                abs_legs.append({
+                    **leg,
+                    "dep": leg["dep"] + win_start,
+                    "arr": leg["arr"] + win_start,
+                })
+            abs_route["legs"] = abs_legs
+            all_routes.append(abs_route)
+            win_abs_routes.append(abs_route)
+
+        if verbose:
+            print(f"\n  Routes this window ({len(win_abs_routes)} crew with legs):")
+            for route in win_abs_routes:
+                if not route["legs"]:
+                    continue
+                print(f"    Crew #{route['crew_id']:>4d} | base {route['base']}")
+                for leg in route["legs"]:
+                    dep_total = leg["dep"]
+                    arr_total = leg["arr"]
+                    day_dep, hm_dep = divmod(dep_total, 1440)
+                    day_arr, hm_arr = divmod(arr_total, 1440)
+                    h_dep, m_dep = divmod(hm_dep, 60)
+                    h_arr, m_arr = divmod(hm_arr, 60)
+                    print(f"      [{leg['type']:8s}] {leg['from']} -> {leg['to']}"
+                          f"  Day{day_dep+1} {h_dep:02d}:{m_dep:02d}"
+                          f" -> Day{day_arr+1} {h_arr:02d}:{m_arr:02d}")
+
+        # ── Translate uncovered flights back to absolute time ─────────────────
+        for f, slots in result.get("uncovered_flights", []):
+            # Reconstruct absolute-time flight object for reporting
+            abs_f = Flight(
+                id=f.id,
+                origin=f.origin,
+                dest=f.dest,
+                dep_min=f.dep_min + win_start,
+                arr_min=f.arr_min + win_start,
+                duration=f.duration,
+                min_crew=f.min_crew,
+                flight_num=f.flight_num,
+                distance=f.distance,
+                seats=f.seats,
+            )
+            object.__setattr__(abs_f, 'needs_coverage', True)
+            all_uncovered.append((abs_f, slots))
+
+        total_cost            += result.get("cost") or 0.0
+        total_flight_cost     += result.get("flight_cost", 0.0)
+        total_dh_cost         += result.get("deadhead_cost", 0.0)
+        total_wait_cost       += result.get("wait_cost", 0.0)
+        total_uncovered_slots += result.get("uncovered_slots", 0.0)
+        covered_count         += result.get("covered_flights", 0)
+        flight_count          += result.get("num_flights", 0)
+
+        crew_positions = result.get("crew_positions") or crew_positions
+
+        win_start += step_min
+        step += 1
+
+    # ── Merge per-window routes into one route per crew member ──────────────
+    # Each window emits a separate route dict per crew_id.  The visualiser
+    # indexes routes by crew_id, so multiple entries for the same crew_id
+    # mean only the last window's legs are visible — all earlier windows
+    # appear empty.  Merge all legs into a single chronological route entry.
+    merged: dict[int, dict] = {}
+    for route in all_routes:
+        cid = route["crew_id"]
+        if cid not in merged:
+            merged[cid] = {
+                "crew_id":    cid,
+                "base":       route["base"],
+                "crew_count": 1,
+                "legs":       [],
+            }
+        merged[cid]["legs"].extend(route["legs"])
+
+    # Sort each crew member's legs chronologically and deduplicate
+    # (the rolling overlap can produce the same leg twice in adjacent windows).
+    seen_legs: dict[int, set] = {}
+    for cid, route in merged.items():
+        unique_legs = []
+        seen = seen_legs.setdefault(cid, set())
+        for leg in sorted(route["legs"], key=lambda l: l["dep"]):
+            key = (leg["from"], leg["to"], leg["dep"], leg["arr"])
+            if key not in seen:
+                seen.add(key)
+                unique_legs.append(leg)
+        route["legs"] = unique_legs
+
+    merged_routes = list(merged.values())
+
+    return {
+        "status": "rolling_horizon",
+        "cost": total_cost,
+        "flight_cost": total_flight_cost,
+        "deadhead_cost": total_dh_cost,
+        "wait_cost": total_wait_cost,
+        "uncovered_slots": total_uncovered_slots,
+        "uncovered_flights": all_uncovered,
+        "routes": merged_routes,
+        "num_flights": flight_count,
+        "covered_flights": covered_count,
+    }
 
 
 # ─────────────────────────────────────────────
 # RESULT SERIALISATION
 # ─────────────────────────────────────────────
 
-def save_result(result: dict, net: CrewFlowNetwork, out_path: str = "crew_result.json"):
+def save_result(result: dict, flights: list[Flight], crew: list[CrewMember],
+                horizon_end: int, flight_end: int,
+                out_path: str = "crew_result.json"):
     import json
 
     routed_crew_ids = {r["crew_id"] for r in result.get("routes", [])}
-    planning_flights = [f for f in net.flights if getattr(f, 'needs_coverage', True)]
+    planning_flights = [f for f in flights if getattr(f, 'needs_coverage', True)]
 
     payload = {
         "meta": {
-            "days": net.flight_end // 1440,
-            "horizon_end": net.horizon_end,
+            "days": flight_end // 1440,
+            "horizon_end": horizon_end,
             "solve_status": result.get("status", "unknown"),
             "total_cost": result.get("cost") or 0.0,
             "flight_cost": result.get("flight_cost", 0.0),
@@ -1566,7 +2250,7 @@ def save_result(result: dict, net: CrewFlowNetwork, out_path: str = "crew_result
         },
         "crew": [
             {"id": c.id, "base": c.base}
-            for c in net.crew
+            for c in crew
         ],
         "flights": [
             {
@@ -1600,7 +2284,7 @@ def save_result(result: dict, net: CrewFlowNetwork, out_path: str = "crew_result
         json.dump(payload, fh, indent=2)
 
     n_routed  = len(routed_crew_ids)
-    n_sitting = len(net.crew) - n_routed
+    n_sitting = len(crew) - n_routed
     print(f"\nResult saved to {out_path}")
     print(f"  {n_routed} crew with routes, {n_sitting} crew sitting at base")
 
@@ -1612,65 +2296,92 @@ def save_result(result: dict, net: CrewFlowNetwork, out_path: str = "crew_result
 def _network_cache_path(csv_path: str, days: int) -> str:
     import os
     base = os.path.splitext(os.path.basename(csv_path))[0]
-    return f"{base}_d{days}_r{RETURN_WINDOW}_rest{MIN_REST//60}_duty{MAX_DUTY_MINUTES//60}_days{MAX_DUTY_DAYS}_flow_network.pkl"
+    return (f"{base}_d{days}_r{RETURN_WINDOW}_rest{MIN_REST//60}_duty"
+            f"{MAX_DUTY_MINUTES//60}_days{MAX_DUTY_DAYS}_flow_network.pkl")
 
 
-def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
+def main(csv_path: str, days: int = DAYS_TO_SOLVE,
+         use_cache: bool = True,
+         rolling: bool = ROLLING_HORIZON):
     import time as _time
     import pickle, os
 
     t0 = _time.time()
-    cache_path = _network_cache_path(csv_path, days)
 
-    if use_cache and os.path.exists(cache_path):
-        print(f"Loading cached network from {cache_path} ...")
-        with open(cache_path, "rb") as fh:
-            net = pickle.load(fh)
-        print(f"  Loaded: {len(net.nodes)} nodes, {len(net.arcs)} arcs  "
-              f"({_time.time()-t0:.1f}s)")
-    else:
-        horizon_days = days + RETURN_WINDOW
-        flights, week_start = parse_flights(csv_path, days, horizon_days=horizon_days)
-        if not flights:
-            print("No flights loaded. Check CSV path and format.")
-            return
+    # ── Two-pass parse: find true week_start first, then load flights ─────────
+    print("Scanning CSV for earliest date (two-pass fix)...")
+    week_start = _find_week_start(csv_path)
+    print(f"  Anchor date: {week_start.date()}")
 
-        flight_end  = days * 1440
-        horizon_end = flight_end + RETURN_WINDOW * 1440
-        print(f"Flight window : day 1–{days}  |  Return deadline: day {days + RETURN_WINDOW}")
+    horizon_days = days + RETURN_WINDOW
+    flights, _ = parse_flights(csv_path, days,
+                               horizon_days=horizon_days,
+                               week_start=week_start)
+    if not flights:
+        print("No flights loaded. Check CSV path and format.")
+        return
 
-        crew = assign_crew_bases(flights)
+    flight_end  = days * 1440
+    horizon_end = flight_end + RETURN_WINDOW * 1440
+    print(f"Flight window : day 1–{days}  |  Return deadline: day {days + RETURN_WINDOW}")
 
-        net = CrewFlowNetwork(
-            flights=flights,
+    # ── Crew base assignment (done once on the full horizon) ──────────────────
+    crew = assign_crew_bases(flights)
+
+    # ── Solve: rolling horizon or monolithic ──────────────────────────────────
+    if rolling:
+        print(f"\nUsing ROLLING HORIZON  "
+              f"(window={WINDOW_DAYS}d, step={STEP_DAYS}d, "
+              f"overlap={WINDOW_DAYS - STEP_DAYS}d)")
+        result = solve_rolling_horizon(
+            all_flights=flights,
             crew=crew,
-            horizon_end=horizon_end,
-            flight_end=flight_end,
-            time_bucket=TIME_BUCKET,
-            verbose=True,
+            days=days,
+            window_days=WINDOW_DAYS,
+            step_days=STEP_DAYS,
+            return_window=RETURN_WINDOW,
         )
-        net.build_initial_network()
+    else:
+        print("\nUsing MONOLITHIC solve")
+        cache_path = _network_cache_path(csv_path, days)
 
-        if use_cache:
-            print(f"Saving network to {cache_path} ...")
-            with open(cache_path, "wb") as fh:
-                pickle.dump(net, fh, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"  Saved ({os.path.getsize(cache_path)/1e6:.1f} MB)")
+        if use_cache and os.path.exists(cache_path):
+            print(f"Loading cached network from {cache_path} ...")
+            with open(cache_path, "rb") as fh:
+                net = pickle.load(fh)
+            print(f"  Loaded: {len(net.nodes)} nodes, {len(net.arcs)} arcs  "
+                  f"({_time.time()-t0:.1f}s)")
+        else:
+            net = CrewFlowNetwork(
+                flights=flights,
+                crew=crew,
+                horizon_end=horizon_end,
+                flight_end=flight_end,
+                time_bucket=TIME_BUCKET,
+                verbose=True,
+            )
+            net.build_initial_network()
 
-    net.build_model()
-    result = net.solve()
+            if use_cache:
+                print(f"Saving network to {cache_path} ...")
+                with open(cache_path, "wb") as fh:
+                    pickle.dump(net, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                print(f"  Saved ({os.path.getsize(cache_path)/1e6:.1f} MB)")
+
+        net.build_model()
+        result = net.solve()
 
     t1 = _time.time()
 
+    # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("SOLUTION SUMMARY")
     print("="*60)
+    print(f"Mode            : {'Rolling horizon' if rolling else 'Monolithic'}")
     print(f"Status          : {result['status']}")
     print(f"Total cost      : {result['cost']:,.1f}" if result['cost'] else "No solution")
     print(f"  Flight hours  : {result.get('flight_cost', 0):,.1f}")
-    print(f"  Deadhead      : {result.get('deadhead_cost', 0):,.1f}"
-          f"  (base: {result.get('deadhead_base_cost', 0):,.1f}"
-          f"  |  opp.cost: {result.get('deadhead_opp_cost', 0):,.1f})")
+    print(f"  Deadhead      : {result.get('deadhead_cost', 0):,.1f}")
     print(f"  Layover/wait  : {result.get('wait_cost', 0):,.1f}")
     print(f"Flights         : {result.get('num_flights', 0)}")
     print(f"Covered         : {result.get('covered_flights', 0)}")
@@ -1685,7 +2396,16 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
                   f"dep={f.dep_min//60:02d}:{f.dep_min%60:02d}  "
                   f"need {f.min_crew} crew, missing {slots:.1f}")
 
+    first_five: list[int] = []
+    for route in result['routes']:
+        if route['crew_id'] not in first_five:
+            first_five.append(route['crew_id'])
+        if len(first_five) == 5:
+            break
+
     for i, route in enumerate(result['routes']):
+        if route['crew_id'] not in first_five:
+            continue
         print(f"\n  Route {i+1} | Crew #{route['crew_id']} | Base: {route['base']}")
         for leg in route['legs']:
             dep_h, dep_m = divmod(leg['dep'], 60)
@@ -1697,12 +2417,16 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE, use_cache: bool = True):
                   f"Day{day_arr+1} {arr_h%24:02d}:{arr_m:02d}")
 
     result_path = os.path.splitext(csv_path)[0] + "_result.json"
-    save_result(result, net, out_path=result_path)
+    save_result(result, flights, crew,
+                horizon_end=horizon_end,
+                flight_end=flight_end,
+                out_path=result_path)
 
-    return result, net
+    return result, flights, crew
 
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/flights_enriched.csv"
-    main(path, days=DAYS_TO_SOLVE)
+    path    = sys.argv[1] if len(sys.argv) > 1 else "data/flights_enriched.csv"
+    rolling = "--monolithic" not in sys.argv   # default: rolling horizon
+    main(path, days=DAYS_TO_SOLVE, rolling=rolling)
