@@ -109,8 +109,19 @@ COST_LAYOVER_MIN   = 0.5
 COST_OVERNIGHT     = 500.0
 COST_UNCOVERED     = 1e7
 
-MAX_DUTY_MINUTES   = 20 * 60
-MAX_DUTY_DAYS      = 5
+MAX_DUTY_MINUTES   = 20 * 60    # max flying minutes before mandatory MIN_REST (reset anywhere)
+MAX_FLYING         = 14 * 60   # alias used in comments; duty is flying-only, matches MAX_DUTY_MINUTES intent
+
+MAX_DUTY_DAYS      = 5          # wall-clock span of a duty period (days); used in network pruning
+
+# Home-reset clocks — enforced per-crew in Stage 2 (flow decomposition) AND
+# as penalty terms in the MIP objective so the solver avoids violations.
+# Both MAX_WORK_DAY and MAX_AWAY_DAYS can ONLY be reset after HOME_BREAK_DAYS
+# consecutive days at the home base.
+MAX_WORK_DAY       = 5          # max calendar days with any flight before mandatory home break
+MAX_AWAY_DAYS      = 7          # max calendar days away from home base before mandatory home break
+HOME_BREAK_DAYS    = 2          # full calendar days at home base required to reset both clocks
+HOME_BREAK         = HOME_BREAK_DAYS * 1440  # same in minutes (2880)
 
 FARE_BASE          = 50.0
 FARE_PER_MILE      = 0.15
@@ -962,32 +973,33 @@ class CrewFlowNetwork:
         self.model: gp.Model | None = None
 
         # Flow variables: (base, arc) -> Var
-        self.var_work:  dict[tuple[str, Arc], gp.Var] = {}
-        self.var_dh:    dict[tuple[str, Arc], gp.Var] = {}
-        self.var_wait:  dict[tuple[str, Arc], gp.Var] = {}
-        self.slack_var: dict[int, gp.Var] = {}
+        self.var_work:      dict[tuple[str, Arc], gp.Var] = {}
+        self.var_dh:        dict[tuple[str, Arc], gp.Var] = {}
+        self.var_wait:      dict[tuple[str, Arc], gp.Var] = {}
+        self.var_home_rest: dict[tuple[str, Arc], gp.Var] = {}  # home-break incentive
+        self.slack_var:     dict[int, gp.Var] = {}
 
         # Constraints
         self.flow_constrs:     dict[str, dict[Node, gp.Constr]] = {}
         self.coverage_constrs: dict[int, gp.Constr] = {}
 
     # ── Pickle compatibility ──────────────────
-    CACHE_VERSION = 1
+    CACHE_VERSION = 2   # bumped: home wait arcs now free + home-break state fix
     _ATTR_DEFAULTS: dict = {'min_duty_at': {}, '_arcs_by_flight': {},
                             '_arc_key_set': set(), 'duty_period_start_at': {}}
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_cache_version'] = self.CACHE_VERSION
-        for key in ('model', 'var_work', 'var_dh', 'var_wait',
+        for key in ('model', 'var_work', 'var_dh', 'var_wait', 'var_home_rest',
                     'slack_var', 'flow_constrs', 'coverage_constrs'):
             state.pop(key, None)
         return state
 
     def __setstate__(self, state):
         import copy
-        for key in ('var_work', 'var_dh', 'var_wait', 'slack_var',
-                    'flow_constrs', 'coverage_constrs'):
+        for key in ('var_work', 'var_dh', 'var_wait', 'var_home_rest',
+                    'slack_var', 'flow_constrs', 'coverage_constrs'):
             state.setdefault(key, {})
         state.setdefault('model', None)
         state.pop('_cache_version', 0)
@@ -1068,8 +1080,14 @@ class CrewFlowNetwork:
 
     def _create_wait_arc(self, from_node: Node, to_node: Node) -> Arc:
         wait_minutes = to_node.time - from_node.time
-        overnight = 1 if wait_minutes >= OVERNIGHT_THRESHOLD else 0
-        cost = wait_minutes * COST_LAYOVER_MIN + overnight * COST_OVERNIGHT
+        # Home base waits are free — crew are supposed to be there and there
+        # is no hotel or per-diem cost.  Away layovers still carry the normal
+        # time + overnight penalty so the solver tries to minimise them.
+        if from_node.airport in self.airports:   # home base
+            cost = 0.0
+        else:
+            overnight = 1 if wait_minutes >= OVERNIGHT_THRESHOLD else 0
+            cost = wait_minutes * COST_LAYOVER_MIN + overnight * COST_OVERNIGHT
         arc = self._make_arc(from_node, to_node, to_node.time, cost, 'wait')
         self.wait_arc_by_start[from_node] = arc
         return arc
@@ -1169,13 +1187,44 @@ class CrewFlowNetwork:
     # ── Network build ─────────────────────────
 
     def build_initial_network(self):
+        """
+        Build the time-expanded flow network.
+
+        Hard constraints enforced by arc pruning — arcs that would violate
+        a rule do not exist, so the MIP physically cannot route crew through them.
+
+        MAX_DUTY_MINUTES  – cumulative flying minutes since last MIN_REST rest.
+                            Resets at any airport after >= MIN_REST wait.
+                            Tracked globally per-node (single counter).
+
+        MAX_WORK_DAY      – distinct calendar days with >= 1 flight since the
+                            last home-base break.
+                            Resets ONLY after >= HOME_BREAK minutes at home base.
+                            Tracked per-base (each base has independent clocks).
+
+        MAX_AWAY_DAYS     – calendar days elapsed since last home-base break.
+                            Same reset rule as MAX_WORK_DAY.
+                            Tracked per-base.
+
+        Per-base home-break state at each node is stored as:
+            (reset_at: int, worked: int, last_day: int)
+        where reset_at is the minute the clocks were last zeroed, worked is the
+        number of distinct flight-days since then, and last_day is the last
+        calendar day index counted (to deduplicate same-day flights).
+        We keep the most favourable (lowest worked, then latest reset_at) state
+        reaching each node so a node is only fully pruned when ALL paths into
+        it are exhausted.
+
+        Results stored in self._arc_allowed_bases: {arc_id: set[base_str]}
+        so build_model can create variables only for (base, arc) pairs where
+        the base is in the allowed set.
+        """
         import time as _t
         self._build_flight_index()
         print("Building network...")
         t0 = _t.time()
 
-        # 1. Depot + horizon nodes for each base, plus position nodes for
-        #    any non-home airport where crew actually start this window.
+        # 1. Depot + horizon nodes for each base.
         for ap in self.airports:
             for t in (DEPOT_TIME_START, self.horizon_end):
                 node = Node(airport=ap, time=t)
@@ -1186,16 +1235,13 @@ class CrewFlowNetwork:
             for base, airport_counts in self.position_supply.items():
                 for ap, count in airport_counts.items():
                     if count > 0 and ap not in self.airports:
-                        # Non-base airport: add a depot-time node so we can
-                        # inject supply there.
                         node = Node(airport=ap, time=DEPOT_TIME_START)
                         self.nodes.add(node)
                         self.nodes_by_airport[ap].add(node)
 
         print(f"  Depot/horizon nodes: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
-        # 2. One node per exact flight dep/arr time — network is fully
-        #    discretised at build time, so no iterative refinement is needed.
+        # 2. One node per exact flight dep/arr time.
         needed: dict[str, set[int]] = defaultdict(set)
         for f in self.flights:
             needed[f.origin].add(f.dep_min)
@@ -1210,50 +1256,69 @@ class CrewFlowNetwork:
                 self.nodes_by_airport[ap].add(node)
         print(f"  All nodes added: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
-        # 3. Wait-arc chains
+        # 3. Wait-arc chains (one per consecutive node pair per airport).
         for ap in self.airports:
-            nodes = self.nodes_by_airport[ap]
-            for i in range(len(nodes) - 1):
-                self._create_wait_arc(nodes[i], nodes[i + 1])
+            nodes_ap = self.nodes_by_airport[ap]
+            for i in range(len(nodes_ap) - 1):
+                self._create_wait_arc(nodes_ap[i], nodes_ap[i + 1])
         print(f"  Wait arcs built  ({_t.time()-t0:.1f}s)")
 
-        # 4. Initialise duty tracking at every base depot.
-        #    duty_period_start_at[node] = wall-clock minute when the current
-        #    duty period began (used to enforce MAX_DUTY_DAYS).
+        # 4. Initialise duty state and home-break state at each depot.
         for ap in self.airports:
             depot = Node(airport=ap, time=DEPOT_TIME_START)
             self.min_duty_at[depot]          = 0
             self.duty_period_start_at[depot] = DEPOT_TIME_START
 
-        # 5. Forward pass in time order: propagate duty through wait arcs
-        #    (resetting on MIN_REST) and build flight arcs simultaneously.
-        #
-        #    Because the network is a DAG ordered by time, processing nodes
-        #    earliest-first guarantees every node's duty is finalised before
-        #    any outgoing arc is considered.
-        #
-        #    Duty rules:
-        #      wait arc >= MIN_REST  →  duty resets to 0, new period starts
-        #      wait arc <  MIN_REST  →  duty carries over (still in duty period)
-        #      flight arc            →  duty += flight.duration
-        #      duty > MAX_DUTY_MINUTES          →  arc pruned
-        #      arr_min - period_start > MAX_DUTY_DAYS*1440  →  arc pruned
+        # _hb[base][node] = (reset_at, worked, last_day, home_wait_acc)
+        # reset_at      : minute clocks were last zeroed (0 = start of planning)
+        # worked        : distinct calendar days with >=1 flight since reset_at
+        # last_day      : last calendar day index counted (dedup)
+        # home_wait_acc : minutes continuously accumulated at home base since the
+        #                 last departure.  Once >= HOME_BREAK the clocks reset.
+        #                 Initialised to HOME_BREAK at the depot so crew that
+        #                 start at home are treated as already rested.
+        _hb: dict[str, dict[Node, tuple[int,int,int,int]]] = {
+            base: {} for base in self.airports
+        }
+        for base in self.airports:
+            depot = Node(airport=base, time=DEPOT_TIME_START)
+            _hb[base][depot] = (DEPOT_TIME_START, 0, -1, HOME_BREAK)
 
-        # Index flights by (origin, dep_min) for O(1) lookup per node
+        # Rolling-horizon windows 2+: carry forward clock state from prior window.
+        # Caller sets self._hb_carry_state = {base: (reset_at, worked, last_day)}.
+        hb_carry: dict[str, tuple[int,int,int]] = getattr(
+            self, '_hb_carry_state', {}
+        )
+        if hb_carry and self.position_supply:
+            for base, airport_counts in self.position_supply.items():
+                carry = hb_carry.get(base, (DEPOT_TIME_START, 0, -1, HOME_BREAK))
+                # Tolerate 3-tuples from an older carry state (add home_wait_acc=0).
+                if len(carry) == 3:
+                    carry = carry + (0,)
+                for ap, count in airport_counts.items():
+                    if count <= 0:
+                        continue
+                    start_node = Node(airport=ap, time=DEPOT_TIME_START)
+                    if start_node not in _hb.get(base, {}):
+                        _hb.setdefault(base, {})[start_node] = carry
+
+        # 5. Forward pass.
         flights_departing: dict[tuple[str, int], list] = defaultdict(list)
         for f in self.flights:
             flights_departing[(f.origin, f.dep_min)].append(f)
 
-        n_arcs = 0
-        n_missing = 0
+        # {arc_id: set[base]} — which bases may traverse each arc
+        self._arc_allowed_bases: dict[int, set[str]] = {}
+
+        n_arcs        = 0
+        n_missing     = 0
         n_pruned_duty = 0
-        n_pruned_days = 0
+        n_pruned_hb   = 0
 
         for node in sorted(self.nodes, key=lambda n: (n.time, n.airport)):
             duty_here = self.min_duty_at.get(node)
             if duty_here is None:
-                continue  # node unreachable from any depot
-
+                continue
             period_start = self.duty_period_start_at.get(node, node.time)
 
             # ── Propagate duty through outgoing wait arc ──────────────────────
@@ -1262,57 +1327,172 @@ class CrewFlowNetwork:
                 next_node = wait_arc.end
                 wait_dur  = next_node.time - node.time
                 if wait_dur >= MIN_REST:
-                    # Sufficient rest: duty counter and period clock both reset
                     new_duty         = 0
                     new_period_start = next_node.time
                 else:
-                    # Still within the same duty period
                     new_duty         = duty_here
                     new_period_start = period_start
-
                 existing = self.min_duty_at.get(next_node, MAX_DUTY_MINUTES + 1)
                 if new_duty < existing:
                     self.min_duty_at[next_node]          = new_duty
                     self.duty_period_start_at[next_node] = new_period_start
 
-            # ── Build flight arcs departing from this node ────────────────────
+            # ── Propagate home-break state through outgoing wait arc ──────────
+            for base in self.airports:
+                hb_here = _hb[base].get(node)
+                if hb_here is None:
+                    continue
+                reset_at, worked, last_day, home_wait_acc = hb_here
+                if wait_arc:
+                    next_node = wait_arc.end
+                    wait_dur  = next_node.time - node.time
+                    if node.airport == base:
+                        # Accumulate home wait across consecutive short arcs.
+                        # Once the running total crosses HOME_BREAK the clocks
+                        # reset — the exact threshold is reached somewhere inside
+                        # this arc, but we credit the reset at next_node.time
+                        # (the next departure opportunity) which is conservative.
+                        new_home_wait = home_wait_acc + wait_dur
+                        if new_home_wait >= HOME_BREAK and home_wait_acc < HOME_BREAK:
+                            # Just crossed the rest threshold — reset both clocks.
+                            new_reset  = next_node.time
+                            new_worked = 0
+                            new_last   = -1
+                        else:
+                            # Still accumulating (or already rested) — no change.
+                            new_reset  = reset_at
+                            new_worked = worked
+                            new_last   = last_day
+                    else:
+                        # Waiting away from home: accumulator does not grow.
+                        new_home_wait = 0
+                        new_reset  = reset_at
+                        new_worked = worked
+                        new_last   = last_day
+                    existing_next = _hb[base].get(next_node)
+                    if (existing_next is None
+                            or new_worked < existing_next[1]
+                            or (new_worked == existing_next[1]
+                                and new_reset > existing_next[0])
+                            or (new_worked == existing_next[1]
+                                and new_reset == existing_next[0]
+                                and new_home_wait > existing_next[3])):
+                        _hb[base][next_node] = (new_reset, new_worked,
+                                                new_last, new_home_wait)
+
+            # ── Build flight arcs from this node ──────────────────────────────
             for f in flights_departing.get((node.airport, node.time), []):
                 arr_node = self._find_node_at_or_after(f.dest, f.arr_min)
                 if arr_node is None:
                     n_missing += 1
                     continue
 
+                # Duty check (global)
                 duty_after = duty_here + f.duration
                 if duty_after > MAX_DUTY_MINUTES:
                     n_pruned_duty += 1
                     continue
-
                 if f.arr_min - period_start > MAX_DUTY_DAYS * 1440:
-                    n_pruned_days += 1
+                    n_pruned_duty += 1
                     continue
 
-                # Propagate duty forward to arrival node (keep minimum)
-                existing = self.min_duty_at.get(arr_node, MAX_DUTY_MINUTES + 1)
-                if duty_after < existing:
+                # Home-break check (per base)
+                # A base is allowed to use this flight arc if its crew at this
+                # node still have budget for another working day and are not
+                # yet past MAX_AWAY_DAYS since their last home break.
+                #
+                # EXCEPTION: flying back to the home base is always allowed,
+                # regardless of clock state — that is the only way to reset the
+                # clocks, so pruning those arcs would make the problem infeasible.
+                allowed_bases: set[str] = set()
+                for base in self.airports:
+                    hb_here = _hb[base].get(node)
+                    if hb_here is None:
+                        continue
+                    reset_at, worked, last_day, home_wait_acc = hb_here
+                    dep_day   = f.dep_min // 1440
+                    # Does this flight add a new working day?
+                    new_worked = worked + (0 if dep_day == last_day else 1)
+                    away_days  = (f.dep_min - reset_at) / 1440.0
+                    # Always allow a direct return to home base.
+                    if f.dest == base:
+                        allowed_bases.add(base)
+                    # FIX (Bug 2): if departing FROM home base, the clocks are
+                    # only considered reset if the crew has actually accumulated
+                    # >= HOME_BREAK minutes at home since arriving.  Without this
+                    # guard the pruning would allow a crew to depart home after
+                    # 30 minutes and count it as a full home break.
+                    elif node.airport == base and home_wait_acc < HOME_BREAK:
+                        # Not enough home rest yet — cannot depart on a non-home
+                        # flight without violating the break rule.  (Returning to
+                        # home on f.dest==base is still allowed above.)
+                        pass
+                    elif new_worked <= MAX_WORK_DAY and away_days <= MAX_AWAY_DAYS:
+                        allowed_bases.add(base)
+
+                if not allowed_bases:
+                    n_pruned_hb += 1
+                    continue
+
+                arc = self._make_arc(node, arr_node, f.arr_min,
+                                     f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
+                n_arcs += 1
+
+                existing_allowed = self._arc_allowed_bases.get(arc.id)
+                if existing_allowed is None:
+                    self._arc_allowed_bases[arc.id] = set(allowed_bases)
+                else:
+                    existing_allowed |= allowed_bases
+
+                # Propagate duty to arrival node
+                existing_duty = self.min_duty_at.get(arr_node, MAX_DUTY_MINUTES + 1)
+                if duty_after < existing_duty:
                     self.min_duty_at[arr_node]          = duty_after
                     self.duty_period_start_at[arr_node] = period_start
 
-                self._make_arc(node, arr_node, f.arr_min,
-                               f.duration * COST_FLIGHT_HOUR, 'flight', f.id)
-                n_arcs += 1
+                # Propagate home-break state to arrival node (per allowed base)
+                for base in allowed_bases:
+                    hb_here  = _hb[base][node]
+                    reset_at, worked, last_day, home_wait_acc_node = hb_here
+                    dep_day    = f.dep_min // 1440
+                    new_worked = worked + (0 if dep_day == last_day else 1)
+                    new_last   = dep_day
+                    # Taking any flight resets the home-wait accumulator to 0.
+                    new_home_wait = 0
+                    # FIX (Bug 3): only reset the away/worked clocks when the crew
+                    # departs from their home base AND they have already accumulated
+                    # >= HOME_BREAK minutes there.  Previously reset_at was carried
+                    # forward unconditionally from the node state, meaning a crew
+                    # that returned home and left 30 minutes later could still have
+                    # reset_at updated as if they had taken a valid break.
+                    if node.airport == base and home_wait_acc_node >= HOME_BREAK:
+                        # Valid home break completed — clocks restart from departure.
+                        new_reset_at = f.dep_min
+                        new_worked   = 1 if dep_day != -1 else 0
+                        new_last     = dep_day
+                    else:
+                        new_reset_at = reset_at
+                    existing_arr = _hb[base].get(arr_node)
+                    if (existing_arr is None
+                            or new_worked < existing_arr[1]
+                            or (new_worked == existing_arr[1]
+                                and new_reset_at > existing_arr[0])):
+                        _hb[base][arr_node] = (new_reset_at, new_worked,
+                                               new_last, new_home_wait)
 
         if n_missing:
             print(f"  WARNING: {n_missing} flights have no connectable arc!")
         if n_pruned_duty:
-            print(f"  Duty-pruned: {n_pruned_duty} arcs exceeded MAX_DUTY_MINUTES "
-                  f"({MAX_DUTY_MINUTES//60}h since last {MIN_REST//60}h rest)")
-        if n_pruned_days:
-            print(f"  Days-pruned: {n_pruned_days} arcs exceeded MAX_DUTY_DAYS "
-                  f"({MAX_DUTY_DAYS} days)")
+            print(f"  Duty-pruned  : {n_pruned_duty} arcs "
+                  f"(exceeded {MAX_DUTY_MINUTES//60}h duty / "
+                  f"{MAX_DUTY_DAYS}d period since last {MIN_REST//60}h rest)")
+        if n_pruned_hb:
+            print(f"  HB-pruned    : {n_pruned_hb} arcs fully pruned "
+                  f"(all bases exceeded MAX_WORK_DAY={MAX_WORK_DAY} or "
+                  f"MAX_AWAY_DAYS={MAX_AWAY_DAYS})")
         print(f"  Flight arcs: {n_arcs}  ({_t.time()-t0:.1f}s)")
         print(f"  Network complete: {len(self.nodes)} nodes, {len(self.arcs)} arcs  "
               f"(total {_t.time()-t0:.1f}s)")
-
     # ── Gurobi model ──────────────────────────
 
     def build_model(self):
@@ -1356,14 +1536,26 @@ class CrewFlowNetwork:
         wait_keys: list[tuple[str, Arc]] = []
         wait_objs: list[float] = []
 
+        # _arc_allowed_bases[arc_id] = set of bases whose crew may traverse
+        # that flight arc without violating MAX_WORK_DAY or MAX_AWAY_DAYS.
+        # Built during build_initial_network.  If the attribute is missing
+        # (e.g. cached network from old code), fall back to allowing all bases.
+        arc_allowed = getattr(self, '_arc_allowed_bases', None)
+
         for base in self.airports:
             reach = reachable[base]
             for arc in flight_arcs:
-                if arc.id in reach:
-                    work_keys.append((base, arc))
-                    work_objs.append(arc.cost)
-                    dh_keys.append((base, arc))
-                    dh_objs.append(dh_cost_cache[arc.flight_id])
+                if arc.id not in reach:
+                    continue
+                # Hard home-break enforcement: skip this (base, arc) pair if
+                # the network build determined this base's crew cannot use it
+                # without violating MAX_WORK_DAY or MAX_AWAY_DAYS.
+                if arc_allowed is not None and base not in arc_allowed.get(arc.id, set()):
+                    continue
+                work_keys.append((base, arc))
+                work_objs.append(arc.cost)
+                dh_keys.append((base, arc))
+                dh_objs.append(dh_cost_cache[arc.flight_id])
             for arc in wait_arcs:
                 if arc.id in reach:
                     wait_keys.append((base, arc))
@@ -1511,6 +1703,67 @@ class CrewFlowNetwork:
 
         self.model.update()
         print(f"  Coverage constraints: {len(self.coverage_constrs)}  ({_t.time()-t0:.1f}s)")
+
+        # ── Mandatory home-break constraints ──────────────────────────────────
+        #
+        # Home breaks are mandatory, not just incentivised.  Arc pruning (in
+        # build_initial_network) prevents crew from taking flights once they
+        # exceed MAX_AWAY_DAYS / MAX_WORK_DAY.  These MIP constraints add a
+        # second, independent layer of enforcement at the flow level:
+        #
+        # For each base b and each MAX_AWAY_DAYS epoch k, the total crew-flow
+        # that ARRIVES at the home base during epoch k must be >= base_crew[b].
+        # This forces the aggregate flow to route all crew through home at
+        # least once in every MAX_AWAY_DAYS window, complementing the per-arc
+        # pruning which handles per-crew clock state.
+        #
+        # We count flow on wait arcs at the home airport whose *cumulative* wait
+        # time reaches HOME_BREAK minutes (2880 min = 48 h).  Short isolated arcs
+        # are excluded; consecutive short arcs whose running total crosses the
+        # threshold are credited at the arc that pushes them over.  Arc pruning
+        # (Bug 2 / Bug 3 fixes) independently prevents crews from departing home
+        # before accumulating enough rest, so both layers now agree on what a
+        # valid home break is.
+
+        epoch_min  = MAX_AWAY_DAYS * 1440
+        n_mand     = 0
+        for base in self.airports:
+            supply = self.base_crew[base]
+            # Collect home wait arcs by epoch.
+            # FIX (Bug 1): only include wait arcs whose *cumulative* home-wait
+            # duration reaches HOME_BREAK minutes.  Previously every wait arc at
+            # the home airport was accepted, so a 15-minute layover could satisfy
+            # the mandatory-rest constraint just as well as a 48-hour break.
+            # We walk arcs in chronological order and carry forward accumulated
+            # wait time so that consecutive short arcs that together cross the
+            # HOME_BREAK threshold are still credited, but short isolated arcs
+            # are not.
+            epoch_arcs: dict[int, list] = defaultdict(list)
+            home_wait_acc: dict[int, int] = {}  # node.time -> cumulative minutes
+            for arc in sorted(
+                (a for a in self.arcs
+                 if a.arc_type == 'wait' and a.start.airport == base
+                 and (base, a) in self.var_wait),
+                key=lambda a: a.start.time,
+            ):
+                dur = arc.end.time - arc.start.time
+                prev = home_wait_acc.get(arc.start.time, 0)
+                acc  = prev + dur
+                home_wait_acc[arc.end.time] = acc
+                if acc >= HOME_BREAK:
+                    epoch = arc.start.time // epoch_min
+                    epoch_arcs[epoch].append((base, arc))
+
+            for epoch, arc_keys in epoch_arcs.items():
+                rest_expr = gp.quicksum(self.var_wait[k] for k in arc_keys)
+                self.model.addConstr(
+                    rest_expr >= supply,
+                    name=f"mand_rest_{base}_ep{epoch}"
+                )
+                n_mand += 1
+
+        self.model.update()
+        print(f"  Mandatory home-break constraints: {n_mand}  ({_t.time()-t0:.1f}s)")
         print(f"  Model built: {self.model.NumVars:,} vars, "
               f"{self.model.NumConstrs:,} constrs  ({_t.time()-t0:.1f}s)")
 
@@ -1632,6 +1885,12 @@ class CrewFlowNetwork:
 
         routes, next_crew_positions = self._decompose_routes(
             crew_positions=crew_positions,
+        )
+
+        # ── Stage 2b: repair any remaining home-break violations ─────────────
+        win_start_abs = getattr(self, '_win_start_min', 0)
+        routes = self._repair_home_break_violations(
+            routes, next_crew_positions, win_start_abs
         )
 
         # ── Rolling horizon: derive end positions from the per-crew position
@@ -1789,8 +2048,30 @@ class CrewFlowNetwork:
 
             for crew_id, depot in ordered:
                 prior_airport = next_crew_positions.get(crew_id, base)
+
+                # Carry the crew's home-wait accumulator into the DFS so it
+                # can enforce the 48-h home-break rule inline.
+                if not hasattr(self, '_hb_states'):
+                    self._hb_states = {}
+                prior_hb = self._hb_states.get(crew_id, {})
+                # home_arr in prior state is an absolute minute; convert to
+                # minutes-accumulated by comparing against the window start.
+                prior_home_arr = prior_hb.get('home_arr', None)
+                win_start_abs  = getattr(self, '_win_start_min', 0)
+                if prior_home_arr is not None and prior_airport == base:
+                    carry_hw = min(HOME_BREAK,
+                                   win_start_abs - prior_home_arr)
+                    carry_hw = max(0, carry_hw)
+                elif prior_airport == base and not prior_hb:
+                    # First window, crew start at home fully rested.
+                    carry_hw = HOME_BREAK
+                else:
+                    carry_hw = 0
+
                 path_arcs = self._trace_path(depot, horizon, base_residual,
-                                             exit_cutoff=exit_cutoff)
+                                             exit_cutoff=exit_cutoff,
+                                             base=base,
+                                             carry_home_wait=carry_hw)
                 if not path_arcs and depot != home:
                     # Flow from this crew's position was already consumed —
                     # fall back to home so they still get a route this window.
@@ -1803,7 +2084,9 @@ class CrewFlowNetwork:
                             f"no flow found there; starting from {base} instead."
                         )
                     path_arcs = self._trace_path(home, horizon, base_residual,
-                                                 exit_cutoff=exit_cutoff)
+                                                 exit_cutoff=exit_cutoff,
+                                                 base=base,
+                                                 carry_home_wait=HOME_BREAK)
                 if not path_arcs:
                     # Truly no flow left for this crew member this window.
                     # They stay wherever next_crew_positions already has them.
@@ -1829,16 +2112,265 @@ class CrewFlowNetwork:
                     })
 
                 if legs:
+                    # ── Home-break compliance check (per-crew DP) ─────────────
+                    hb_states = self._hb_states
+                    prior     = hb_states.get(crew_id, {})
+
+                    viols, new_state = self._check_home_break(
+                        legs, base, win_start_abs,
+                        carry_reset_at = prior.get('reset_at', 0),
+                        carry_last_day = prior.get('last_day', -1),
+                        carry_worked   = prior.get('worked',   0),
+                        carry_home_arr = prior.get('home_arr', None),
+                    )
+                    # Persist updated state for next window
+                    hb_states[crew_id] = new_state
+
+                    if viols:
+                        n_hb_violations = getattr(self, '_hb_violation_count', 0)
+                        self._hb_violation_count = n_hb_violations + len(viols)
+                        if n_hb_violations == 0:   # print first occurrence only
+                            print(f"  HOME-BREAK violation crew {crew_id} ({base}): "
+                                  f"{viols[0]}")
+
                     routes.append({
-                        "crew_id":    crew_id,
-                        "base":       base,
-                        "crew_count": 1,
-                        "legs":       legs,
+                        "crew_id":       crew_id,
+                        "base":          base,
+                        "crew_count":    1,
+                        "legs":          legs,
+                        "hb_violations": viols,
                     })
                     # Update this crew member's position to their last leg destination.
                     next_crew_positions[crew_id] = legs[-1]["to"]
 
         return routes, next_crew_positions
+
+    # ── Home-break enforcement (Stage 2, per-crew) ───────────────────────────
+    #
+    # The MIP uses a flat network so it knows nothing about MAX_WORK_DAY or
+    # MAX_AWAY_DAYS.  After each crew member's path is traced we simulate their
+    # clocks exactly (like the Java DP does for individual workers) and flag any
+    # window that contains a violation.
+    #
+    # Clock rules (identical to the spec):
+    #   days_worked : # distinct calendar days with >=1 flight since last HOME_BREAK
+    #   days_away   : # whole days elapsed since left home base
+    #   Both reset only after HOME_BREAK minutes (48h) at home base.
+    #   Violation: either counter reaches its limit without a home break first.
+
+    @staticmethod
+    def _check_home_break(legs: list[dict], base: str, win_start_min: int,
+                          carry_reset_at: int = 0,
+                          carry_last_day: int = -1,
+                          carry_worked: int = 0,
+                          carry_home_arr: int | None = None,
+                          ) -> tuple[list[str], dict]:
+        """
+        Simulate home-reset clocks for one crew member's legs in this window.
+
+        Accepts carry-over state from the previous window so multi-window
+        violations are detected correctly.  win_start_min MUST be the absolute
+        minute offset of the window start (0 for monolithic, win_start for
+        rolling horizon) so that dep_abs is always a true planning-horizon minute.
+
+        Returns (violations, state) where state carries into the next window.
+
+        Clock rules (per spec)
+        ----------------------
+        MAX_WORK_DAY  : max distinct calendar days with >=1 flight since last reset.
+        MAX_AWAY_DAYS : max calendar days elapsed since last reset.
+        Both clocks reset ONLY after HOME_BREAK_DAYS full calendar days spent at
+        the home base (i.e. crew arrive home and the next departure from home is
+        >= HOME_BREAK minutes later).
+
+        reset_at  : absolute minute from which away-time is measured.
+                    Initialised to the start of planning (0).
+                    Updated to the departure minute of the leg that follows a
+                    valid home break.
+        home_arr  : absolute minute of the most recent arrival at home base.
+                    None if crew have not yet returned home this period.
+        worked    : distinct calendar days with >=1 flight since reset_at.
+        last_day  : calendar day index of the last counted flight (dedup).
+
+        Violation flags are raised at most once per counter per period to avoid
+        flooding the log with repeated messages for the same breach.
+        """
+        violations = []
+        reset_at       = carry_reset_at
+        last_day       = carry_last_day
+        worked         = carry_worked
+        home_arr       = carry_home_arr
+        away_violated  = False   # raise each breach at most once
+        work_violated  = False
+
+        for leg in legs:
+            # dep/arr in legs are window-local minutes; add offset for absolute time.
+            dep_abs = leg["dep"] + win_start_min
+            arr_abs = leg["arr"] + win_start_min
+            frm     = leg["from"]
+            to      = leg["to"]
+
+            # ── Check for a valid home break before this departure ────────────
+            # Condition: departing FROM home base AND previously arrived home
+            # (home_arr is set) AND waited >= HOME_BREAK minutes.
+            if frm == base and home_arr is not None:
+                wait = dep_abs - home_arr
+                if wait >= HOME_BREAK:
+                    # Valid 2-day home break: reset both clocks from departure.
+                    reset_at      = dep_abs
+                    last_day      = -1
+                    worked        = 0
+                    away_violated = False
+                    work_violated = False
+                # Crew is now departing home regardless — clear home_arr.
+                home_arr = None
+
+            # ── Accumulate days worked (one entry per distinct calendar day) ──
+            dep_day = dep_abs // 1440
+            if dep_day != last_day:
+                worked  += 1
+                last_day = dep_day
+
+            # ── Days away since last reset ────────────────────────────────────
+            away = (dep_abs - reset_at) / 1440.0
+
+            # ── Check limits — flag first breach only per period ─────────────
+            day_label = dep_day + 1   # 1-indexed for display
+            if away > MAX_AWAY_DAYS and not away_violated:
+                violations.append(
+                    f"Day {day_label}: away {away:.1f}d > {MAX_AWAY_DAYS}d "
+                    f"({frm}->{to})"
+                )
+                away_violated = True
+
+            if worked > MAX_WORK_DAY and not work_violated:
+                violations.append(
+                    f"Day {day_label}: worked {worked}d > {MAX_WORK_DAY}d "
+                    f"({frm}->{to})"
+                )
+                work_violated = True
+
+            # ── Track home arrival ────────────────────────────────────────────
+            # Only update when arriving at home base; do NOT clear when departing
+            # from a non-home airport (crew may still fly home later).
+            if to == base:
+                home_arr = arr_abs
+
+        state = {
+            "reset_at": reset_at,
+            "last_day":  last_day,
+            "worked":    worked,
+            "home_arr":  home_arr,
+        }
+        return violations, state
+
+    def _repair_home_break_violations(
+        self,
+        routes: list[dict],
+        next_crew_positions: dict[int, str],
+        win_start_min: int,
+    ) -> list[dict]:
+        """
+        Post-solve repair pass: for any crew route that still violates
+        MAX_WORK_DAY or MAX_AWAY_DAYS, insert a synthetic 48-h home-base
+        layover after the last leg that doesn't yet breach the limit.
+
+        This is a best-effort greedy fix.  It trims the offending tail of the
+        route and records the crew as parked at home for the next window.
+        It does NOT re-optimise coverage — any flights that were covered by
+        the trimmed legs will show as uncovered in the window stats.
+
+        Parameters
+        ----------
+        routes             : list of route dicts (mutated in-place)
+        next_crew_positions: {crew_id: airport} — updated if trimming changes
+                             a crew member's end position
+        win_start_min      : absolute minute offset for clock arithmetic
+
+        Returns
+        -------
+        The (possibly modified) routes list.
+        """
+        hb_states = getattr(self, '_hb_states', {})
+        repaired  = 0
+
+        for route in routes:
+            crew_id = route["crew_id"]
+            base    = route["base"]
+            legs    = route["legs"]
+            if not legs:
+                continue
+
+            # Re-run the home-break check to get per-leg clock state.
+            prior = hb_states.get(crew_id, {})
+            viols, _ = self._check_home_break(
+                legs, base, win_start_min,
+                carry_reset_at = prior.get('reset_at', 0),
+                carry_last_day = prior.get('last_day', -1),
+                carry_worked   = prior.get('worked',   0),
+                carry_home_arr = prior.get('home_arr', None),
+            )
+            if not viols:
+                continue
+
+            # Walk legs one-by-one, re-simulating clocks, and cut at first breach.
+            reset_at      = prior.get('reset_at', 0)
+            last_day      = prior.get('last_day', -1)
+            worked        = prior.get('worked',   0)
+            home_arr      = prior.get('home_arr', None)
+            cut_idx       = None
+
+            for i, leg in enumerate(legs):
+                dep_abs = leg["dep"] + win_start_min
+                arr_abs = leg["arr"] + win_start_min
+                frm     = leg["from"]
+                to      = leg["to"]
+
+                if frm == base and home_arr is not None:
+                    if dep_abs - home_arr >= HOME_BREAK:
+                        reset_at = dep_abs
+                        last_day = -1
+                        worked   = 0
+                    home_arr = None
+
+                dep_day = dep_abs // 1440
+                if dep_day != last_day:
+                    worked  += 1
+                    last_day = dep_day
+
+                away = (dep_abs - reset_at) / 1440.0
+
+                if away > MAX_AWAY_DAYS or worked > MAX_WORK_DAY:
+                    cut_idx = i
+                    break
+
+                if to == base:
+                    home_arr = arr_abs
+
+            if cut_idx is not None and cut_idx > 0:
+                # Trim route to the legs before the first breach.
+                route["legs"] = legs[:cut_idx]
+                last_leg      = legs[cut_idx - 1]
+                end_airport   = last_leg["to"]
+                next_crew_positions[crew_id] = end_airport
+                route["hb_violations"] = viols
+                repaired += 1
+
+                # Update the crew's carry state to reflect the trimmed route.
+                _, new_state = self._check_home_break(
+                    route["legs"], base, win_start_min,
+                    carry_reset_at = prior.get('reset_at', 0),
+                    carry_last_day = prior.get('last_day', -1),
+                    carry_worked   = prior.get('worked',   0),
+                    carry_home_arr = prior.get('home_arr', None),
+                )
+                hb_states[crew_id] = new_state
+
+        if repaired:
+            print(f"  Home-break repair: trimmed {repaired} route(s) at violation point")
+
+        self._hb_states = hb_states
+        return routes
 
     def _trace_path(
         self,
@@ -1846,6 +2378,8 @@ class CrewFlowNetwork:
         sink: Node,
         residual: dict[Arc, int],
         exit_cutoff: int | None = None,
+        base: str | None = None,
+        carry_home_wait: int = HOME_BREAK,
     ) -> list[Arc] | None:
         """
         Greedy DFS from source to sink (or any node at/after exit_cutoff) through
@@ -1857,16 +2391,29 @@ class CrewFlowNetwork:
             home-base horizon node yet.  The explicit sink is still checked first
             so last-window behaviour is unchanged.
         Prefers flight > deadhead > wait arcs for meaningful pairings.
+
+        base / carry_home_wait : when set, the DFS enforces the 48-hour home-break
+            rule inline.  carry_home_wait is the accumulated home-wait minutes
+            at the source node (HOME_BREAK = fully rested / never been away;
+            0 = just arrived home with no rest yet).  A flight arc departing
+            FROM the home airport is only traversed if the running home-wait
+            accumulator at that node has reached HOME_BREAK.  Wait arcs at the
+            home airport increment the accumulator; any other arc resets it to 0.
+            This ensures the DFS naturally routes through valid 48-h home breaks
+            rather than touching home briefly and immediately departing.
         """
         type_priority = {'flight': 0, 'deadhead': 1, 'wait': 2}
 
         parent: dict[Node, Arc | None] = {source: None}
+        # home_wait[node] = accumulated minutes at home base up to this node
+        home_wait: dict[Node, int] = {source: carry_home_wait}
         # Track the best terminal node found (latest time at/after cutoff)
         best_terminal: Node | None = None
         stack = [source]
 
         while stack:
             node = stack.pop()
+            hw_here = home_wait.get(node, 0)
 
             if node == sink:
                 # Exact horizon match — reconstruct immediately.
@@ -1889,10 +2436,37 @@ class CrewFlowNetwork:
                 a for a in self.arcs_from.get(node, [])
                 if residual.get(a, 0) > 0 and a.end not in parent
             ]
+
+            # Home-break enforcement: if this node is at the home airport and the
+            # crew have not yet accumulated HOME_BREAK minutes here, block any
+            # outbound flight/deadhead arc.  Wait arcs at home are always allowed
+            # (they accumulate rest); return-to-home arcs are always allowed.
+            if base is not None and node.airport == base and hw_here < HOME_BREAK:
+                candidates = [
+                    a for a in candidates
+                    if a.arc_type == 'wait'          # keep accumulating rest
+                    or a.end.airport == base         # allow further home arrivals
+                ]
+
             candidates.sort(key=lambda a: (type_priority.get(a.arc_type, 9), a.end.time))
 
             for arc in reversed(candidates):
+                if arc.end in parent:
+                    continue
                 parent[arc.end] = arc
+                # Update running home-wait accumulator for the next node.
+                if base is not None:
+                    if arc.arc_type == 'wait' and arc.start.airport == base:
+                        hw_next = hw_here + (arc.end.time - arc.start.time)
+                    elif arc.end.airport == base:
+                        # Arriving at home: start counting rest from 0.
+                        hw_next = arc.end.time - arc.end.time  # = 0
+                    else:
+                        # Away from home: accumulator does not grow.
+                        hw_next = 0
+                else:
+                    hw_next = HOME_BREAK  # no enforcement
+                home_wait[arc.end] = hw_next
                 stack.append(arc.end)
 
         # No path to exact sink — if a free-exit terminal was found, use it.
@@ -2016,6 +2590,7 @@ def solve_rolling_horizon(
     # window can start each crew from their actual location and preserve identity.
     # Also used to derive position_supply so both sources are always consistent.
     crew_positions: dict[int, str] | None = None
+    hb_states: dict[int, dict] = {}   # home-break clock carry-over per crew
 
     step = 0
     win_start = 0
@@ -2098,7 +2673,59 @@ def solve_rolling_horizon(
             window_offset=win_start,
             position_supply=win_position_supply,
         )
-        net.is_last_window = is_last
+        net.is_last_window      = is_last
+        net._win_start_min      = win_start   # absolute minute offset for clock arithmetic
+        net._hb_violation_count = 0
+        net._hb_states          = hb_states   # carry-over detection state from prior window
+
+        # ── Carry home-break network state into build_initial_network ─────────
+        # hb_states[crew_id] = {reset_at, worked, last_day, home_arr}
+        # We need a per-BASE aggregate: the worst-case (highest worked, lowest
+        # reset_at) across all crew from that base, so the network pruning is
+        # conservative (never allows more than the most-constrained crew).
+        # Using worst-case means some crew may still have budget the network
+        # doesn't give them, but it guarantees no violations slip through.
+        if hb_states:
+            base_map = {c.id: c.base for c in crew}
+            # {base: (reset_at, worked, last_day, home_wait_acc)}
+            hb_carry_state: dict[str, tuple[int,int,int,int]] = {}
+            for cid, state in hb_states.items():
+                base = base_map.get(cid)
+                if base is None:
+                    continue
+                # Convert absolute reset_at to window-local by subtracting win_start
+                reset_abs = state.get('reset_at', 0)
+                reset_local = reset_abs - win_start   # may be negative for old resets
+                worked   = state.get('worked',   0)
+                last_day = state.get('last_day', -1)
+                # Window-local last_day: convert abs day to local day index
+                last_day_local = (last_day * 1440 - win_start) // 1440 if last_day >= 0 else -1
+                # home_wait_acc: if crew are at home at window end, carry forward
+                # however many minutes they've accumulated; otherwise reset to 0.
+                # hb_states tracks home_arr (when they last arrived home).
+                home_arr = state.get('home_arr', None)
+                if home_arr is not None:
+                    home_wait_acc = max(0, win_start + (win_commit - win_start) - home_arr)
+                    home_wait_acc = min(home_wait_acc, HOME_BREAK)  # cap at threshold
+                else:
+                    home_wait_acc = 0
+
+                existing = hb_carry_state.get(base)
+                if existing is None:
+                    hb_carry_state[base] = (reset_local, worked, last_day_local, home_wait_acc)
+                else:
+                    # Keep worst case: highest worked, then earliest (lowest) reset,
+                    # then lowest home_wait_acc (least rested — most conservative).
+                    ex_reset, ex_worked, ex_last, ex_hw = existing
+                    if (worked > ex_worked
+                            or (worked == ex_worked and reset_local < ex_reset)
+                            or (worked == ex_worked and reset_local == ex_reset
+                                and home_wait_acc < ex_hw)):
+                        hb_carry_state[base] = (reset_local, worked, last_day_local, home_wait_acc)
+            net._hb_carry_state = hb_carry_state
+        else:
+            net._hb_carry_state = {}
+
         net.build_initial_network()
         net.build_model()
         result = net.solve(crew_positions=crew_positions)
@@ -2113,6 +2740,13 @@ def solve_rolling_horizon(
             print(f"  Flights in window     : {result.get('num_flights', 0)}")
             print(f"  Covered               : {result.get('covered_flights', 0)}")
             print(f"  Uncovered slots       : {result.get('uncovered_slots', 0):.1f}")
+
+        if verbose:
+            hb_viols = getattr(net, '_hb_violation_count', 0)
+            if hb_viols:
+                print(f"  Home-break violations : {hb_viols} (crew rescheduling needed)")
+            else:
+                print(f"  Home-break violations : 0  ✓")
 
         # ── Translate routes back to absolute time ────────────────────────────
         win_abs_routes = []
@@ -2173,6 +2807,7 @@ def solve_rolling_horizon(
         flight_count          += result.get("num_flights", 0)
 
         crew_positions = result.get("crew_positions") or crew_positions
+        hb_states = getattr(net, "_hb_states", hb_states)  # carry clock state forward
 
         win_start += step_min
         step += 1
@@ -2297,7 +2932,8 @@ def _network_cache_path(csv_path: str, days: int) -> str:
     import os
     base = os.path.splitext(os.path.basename(csv_path))[0]
     return (f"{base}_d{days}_r{RETURN_WINDOW}_rest{MIN_REST//60}_duty"
-            f"{MAX_DUTY_MINUTES//60}_days{MAX_DUTY_DAYS}_flow_network.pkl")
+            f"{MAX_DUTY_MINUTES//60}_days{MAX_DUTY_DAYS}_hb{HOME_BREAK_DAYS}"
+            f"_flow_network.pkl")
 
 
 def main(csv_path: str, days: int = DAYS_TO_SOLVE,
@@ -2369,6 +3005,7 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE,
                 print(f"  Saved ({os.path.getsize(cache_path)/1e6:.1f} MB)")
 
         net.build_model()
+        net._win_start_min = 0   # monolithic: all times are absolute from day 0
         result = net.solve()
 
     t1 = _time.time()
