@@ -78,8 +78,7 @@ DAYS_TO_SOLVE      = 30
 RETURN_WINDOW      = 7
 RANDOM_SEED        = 42069
 MIN_CREW_PER_BASE  = 5
-MAX_BASES          = 20       # number of full crew bases (k-median hubs)
-TIME_BUCKET        = 15
+MAX_BASES          = 30       # number of full crew bases (k-median hubs)
 MIN_TURNAROUND     = 45
 MIN_REST           = 8 * 60
 OVERNIGHT_THRESHOLD = 4 * 60
@@ -110,7 +109,6 @@ COST_OVERNIGHT     = 500.0
 COST_UNCOVERED     = 1e7
 
 MAX_DUTY_MINUTES   = 20 * 60    # max flying minutes before mandatory MIN_REST (reset anywhere)
-MAX_FLYING         = 14 * 60   # alias used in comments; duty is flying-only, matches MAX_DUTY_MINUTES intent
 
 MAX_DUTY_DAYS      = 5          # wall-clock span of a duty period (days); used in network pruning
 
@@ -122,11 +120,6 @@ MAX_WORK_DAY       = 5          # max calendar days with any flight before manda
 MAX_AWAY_DAYS      = 7          # max calendar days away from home base before mandatory home break
 HOME_BREAK_DAYS    = 2          # full calendar days at home base required to reset both clocks
 HOME_BREAK         = HOME_BREAK_DAYS * 1440  # same in minutes (2880)
-
-FARE_BASE          = 50.0
-FARE_PER_MILE      = 0.15
-LF_LOW_THRESHOLD   = 0.75
-LF_HIGH_THRESHOLD  = 0.90
 
 DEPOT_TIME_START   = 0
 LARGE              = int(1e9)
@@ -772,22 +765,11 @@ def assign_crew_bases(
 # COST HELPERS
 # ─────────────────────────────────────────────
 
-def estimated_fare(distance_miles: float) -> float:
-    return FARE_BASE + FARE_PER_MILE * max(0.0, distance_miles)
+DEADHEAD_COST_PER_MIN = COST_DEADHEAD_BASE + 0.123  # base wage + flat opportunity cost at avg LF=0.82
 
-def opportunity_cost_scale(load_factor: float) -> float:
-    if load_factor <= LF_LOW_THRESHOLD:
-        return 0.0
-    if load_factor >= LF_HIGH_THRESHOLD:
-        return 1.0
-    return (load_factor - LF_LOW_THRESHOLD) / (LF_HIGH_THRESHOLD - LF_LOW_THRESHOLD)
-
-def deadhead_cost(flight: Flight, load_factor: float | None = None) -> float:
-    lf = load_factor if load_factor is not None else 0.82
-    base = flight.duration * COST_DEADHEAD_BASE
-    fare = estimated_fare(flight.distance)
-    opp  = fare * opportunity_cost_scale(lf)
-    return base + opp
+def deadhead_cost(flight: Flight) -> float:
+    """Flat deadhead cost: crew wage rate + fixed opportunity cost per minute."""
+    return flight.duration * DEADHEAD_COST_PER_MIN
 
 
 # ─────────────────────────────────────────────
@@ -909,7 +891,6 @@ class CrewFlowNetwork:
         crew: list[CrewMember],
         horizon_end: int,
         flight_end: int | None = None,
-        time_bucket: int = TIME_BUCKET,
         verbose: bool = True,
         window_offset: int = 0,
         base_supply_override: dict[str, int] | None = None,
@@ -947,7 +928,6 @@ class CrewFlowNetwork:
 
         self.horizon_end    = horizon_end
         self.flight_end     = flight_end if flight_end is not None else horizon_end
-        self.time_bucket    = time_bucket
         self.verbose        = verbose
         self.window_offset  = window_offset   # minutes offset for this window
         # True only for the final rolling-horizon window (or monolithic solve).
@@ -976,7 +956,6 @@ class CrewFlowNetwork:
         self.var_work:      dict[tuple[str, Arc], gp.Var] = {}
         self.var_dh:        dict[tuple[str, Arc], gp.Var] = {}
         self.var_wait:      dict[tuple[str, Arc], gp.Var] = {}
-        self.var_home_rest: dict[tuple[str, Arc], gp.Var] = {}  # home-break incentive
         self.slack_var:     dict[int, gp.Var] = {}
 
         # Constraints
@@ -991,14 +970,14 @@ class CrewFlowNetwork:
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_cache_version'] = self.CACHE_VERSION
-        for key in ('model', 'var_work', 'var_dh', 'var_wait', 'var_home_rest',
+        for key in ('model', 'var_work', 'var_dh', 'var_wait',
                     'slack_var', 'flow_constrs', 'coverage_constrs'):
             state.pop(key, None)
         return state
 
     def __setstate__(self, state):
         import copy
-        for key in ('var_work', 'var_dh', 'var_wait', 'var_home_rest',
+        for key in ('var_work', 'var_dh', 'var_wait',
                     'slack_var', 'flow_constrs', 'coverage_constrs'):
             state.setdefault(key, {})
         state.setdefault('model', None)
@@ -1029,17 +1008,6 @@ class CrewFlowNetwork:
                 setattr(self, attr, copy.deepcopy(default))
 
     # ── Node helpers ─────────────────────────
-
-    def _find_node(self, airport: str, time: int, round_down=True) -> Node | None:
-        nodes = self.nodes_by_airport[airport]
-        if not nodes:
-            return None
-        if round_down:
-            idx = nodes.bisect_key_right(time) - 1
-            return nodes[idx] if idx >= 0 else None
-        else:
-            idx = nodes.bisect_key_left(time)
-            return nodes[idx] if idx < len(nodes) else None
 
     def _find_node_at_or_after(self, airport: str, time: int) -> Node | None:
         nodes = self.nodes_by_airport[airport]
@@ -1314,6 +1282,7 @@ class CrewFlowNetwork:
         n_missing     = 0
         n_pruned_duty = 0
         n_pruned_hb   = 0
+        n_pruned_ta   = 0
 
         for node in sorted(self.nodes, key=lambda n: (n.time, n.airport)):
             duty_here = self.min_duty_at.get(node)
@@ -1382,10 +1351,26 @@ class CrewFlowNetwork:
 
             # ── Build flight arcs from this node ──────────────────────────────
             for f in flights_departing.get((node.airport, node.time), []):
-                arr_node = self._find_node_at_or_after(f.dest, f.arr_min)
+                # Turnaround check: crew who just arrived need MIN_TURNAROUND
+                # minutes on the ground before they can operate the next flight.
+                # We enforce this by snapping the arrival node forward: the crew
+                # cannot board flight f until arr_min + MIN_TURNAROUND, so we
+                # find the first network node at or after that time at f.dest.
+                # At the depot (time=0) crew have no prior arrival, so no snap.
+                earliest_arr = f.arr_min + (MIN_TURNAROUND if node.time > DEPOT_TIME_START else 0)
+                arr_node = self._find_node_at_or_after(f.dest, earliest_arr)
                 if arr_node is None:
                     n_missing += 1
                     continue
+
+                # Original arrival node (without turnaround padding) — used to
+                # detect whether turnaround pruning actually shifted the node.
+                raw_arr_node = self._find_node_at_or_after(f.dest, f.arr_min)
+                if raw_arr_node is None or arr_node.time > raw_arr_node.time:
+                    # Turnaround padding pushed us to a later node (or off the
+                    # horizon entirely — already caught by arr_node is None above).
+                    if arr_node.time != f.arr_min:
+                        n_pruned_ta += 1
 
                 # Duty check (global)
                 duty_after = duty_here + f.duration
@@ -1482,6 +1467,9 @@ class CrewFlowNetwork:
 
         if n_missing:
             print(f"  WARNING: {n_missing} flights have no connectable arc!")
+        if n_pruned_ta:
+            print(f"  Turnaround-pruned: {n_pruned_ta} arcs "
+                  f"(< {MIN_TURNAROUND} min ground time)")
         if n_pruned_duty:
             print(f"  Duty-pruned  : {n_pruned_duty} arcs "
                   f"(exceeded {MAX_DUTY_MINUTES//60}h duty / "
@@ -1864,40 +1852,18 @@ class CrewFlowNetwork:
                 if sv > eps:
                     uncovered.append((f, sv))
 
-        flight_cost  = sum(arc.cost * v.X
-                           for (base, arc), v in self.var_work.items() if v.X > eps)
-        dh_base_cost = 0.0
-        dh_opp_cost  = 0.0
-        for (base, arc), v in self.var_dh.items():
-            val = v.X
-            if val <= eps:
-                continue
-            f = self.flights_by_id.get(arc.flight_id)
-            if f:
-                base_c = f.duration * COST_DEADHEAD_BASE * val
-                opp    = (arc.cost - f.duration * COST_DEADHEAD_BASE) * val
-                dh_base_cost += base_c
-                dh_opp_cost  += opp
-            else:
-                dh_base_cost += arc.cost * val
-        wait_cost = sum(arc.cost * v.X
-                        for (base, arc), v in self.var_wait.items() if v.X > eps)
+        flight_cost = sum(arc.cost * v.X
+                          for (base, arc), v in self.var_work.items() if v.X > eps)
+        dh_cost     = sum(arc.cost * v.X
+                          for (base, arc), v in self.var_dh.items()   if v.X > eps)
+        wait_cost   = sum(arc.cost * v.X
+                          for (base, arc), v in self.var_wait.items() if v.X > eps)
 
         routes, next_crew_positions = self._decompose_routes(
             crew_positions=crew_positions,
         )
 
-        # ── Stage 2b: repair any remaining home-break violations ─────────────
-        win_start_abs = getattr(self, '_win_start_min', 0)
-        routes = self._repair_home_break_violations(
-            routes, next_crew_positions, win_start_abs
-        )
-
-        # ── Rolling horizon: derive end positions from the per-crew position
-        # map (single source of truth).  _extract_end_positions() used a
-        # separate arc-straddle counter that could disagree with
-        # _decompose_routes when a crew member was mid-flight at the commit
-        # cut, causing phantom teleports in the next window.
+        # ── Rolling horizon: derive end positions from the per-crew position map ──
         base_map = {c.id: c.base for c in self.crew}
         end_positions: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for cid, airport in next_crew_positions.items():
@@ -1910,9 +1876,7 @@ class CrewFlowNetwork:
             "status": "optimal" if self.model.Status == GRB.OPTIMAL else "suboptimal",
             "cost": obj,
             "flight_cost": flight_cost,
-            "deadhead_cost": dh_base_cost + dh_opp_cost,
-            "deadhead_base_cost": dh_base_cost,
-            "deadhead_opp_cost": dh_opp_cost,
+            "deadhead_cost": dh_cost,
             "wait_cost": wait_cost,
             "uncovered_slots": sum(v for _, v in uncovered),
             "uncovered_flights": uncovered,
@@ -1924,41 +1888,6 @@ class CrewFlowNetwork:
             "covered_flights": len([f for f in self.flights
                                      if getattr(f, 'needs_coverage', True)]) - len(uncovered),
         }
-
-    def _extract_end_positions(self) -> dict[str, dict[str, int]]:
-        """
-        For rolling horizon: determine how many crew from each home base are
-        at each airport at t = flight_end (the commit cut-point).
-
-        Returns {airport: {home_base: count}} so the next window can use the
-        actual airport as the new depot, rather than assuming everyone is home.
-
-        The commit point is flight_end (= step_days * 1440 in absolute time).
-        We look at the flow on arcs that straddle or terminate at that time.
-        """
-        eps = 1e-4
-        commit_t = self.flight_end
-        # {(airport, home_base): count}
-        positions: dict[tuple[str, str], int] = defaultdict(int)
-
-        for (base, arc), var in {**self.var_work, **self.var_dh, **self.var_wait}.items():
-            val = round(var.X) if var.X > eps else 0
-            if val <= 0:
-                continue
-            # Crew on this arc are in-transit at commit_t if they departed before
-            # and arrive after — treat them as being at arc.start.airport.
-            # Crew who have finished this arc by commit_t are at arc.end.airport.
-            if arc.start.time <= commit_t <= arc.true_end:
-                positions[(arc.start.airport, base)] += val
-            elif arc.true_end <= commit_t and arc.end.time >= commit_t:
-                positions[(arc.end.airport, base)] += val
-
-        # Reshape to {home_base: {airport: count}} — the shape position_supply expects.
-        result: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for (airport, home_base), count in positions.items():
-            result[home_base][airport] += count
-
-        return {k: dict(v) for k, v in result.items()}
 
     # ── Stage 2: flow decomposition ───────────
 
@@ -2264,114 +2193,6 @@ class CrewFlowNetwork:
         }
         return violations, state
 
-    def _repair_home_break_violations(
-        self,
-        routes: list[dict],
-        next_crew_positions: dict[int, str],
-        win_start_min: int,
-    ) -> list[dict]:
-        """
-        Post-solve repair pass: for any crew route that still violates
-        MAX_WORK_DAY or MAX_AWAY_DAYS, insert a synthetic 48-h home-base
-        layover after the last leg that doesn't yet breach the limit.
-
-        This is a best-effort greedy fix.  It trims the offending tail of the
-        route and records the crew as parked at home for the next window.
-        It does NOT re-optimise coverage — any flights that were covered by
-        the trimmed legs will show as uncovered in the window stats.
-
-        Parameters
-        ----------
-        routes             : list of route dicts (mutated in-place)
-        next_crew_positions: {crew_id: airport} — updated if trimming changes
-                             a crew member's end position
-        win_start_min      : absolute minute offset for clock arithmetic
-
-        Returns
-        -------
-        The (possibly modified) routes list.
-        """
-        hb_states = getattr(self, '_hb_states', {})
-        repaired  = 0
-
-        for route in routes:
-            crew_id = route["crew_id"]
-            base    = route["base"]
-            legs    = route["legs"]
-            if not legs:
-                continue
-
-            # Re-run the home-break check to get per-leg clock state.
-            prior = hb_states.get(crew_id, {})
-            viols, _ = self._check_home_break(
-                legs, base, win_start_min,
-                carry_reset_at = prior.get('reset_at', 0),
-                carry_last_day = prior.get('last_day', -1),
-                carry_worked   = prior.get('worked',   0),
-                carry_home_arr = prior.get('home_arr', None),
-            )
-            if not viols:
-                continue
-
-            # Walk legs one-by-one, re-simulating clocks, and cut at first breach.
-            reset_at      = prior.get('reset_at', 0)
-            last_day      = prior.get('last_day', -1)
-            worked        = prior.get('worked',   0)
-            home_arr      = prior.get('home_arr', None)
-            cut_idx       = None
-
-            for i, leg in enumerate(legs):
-                dep_abs = leg["dep"] + win_start_min
-                arr_abs = leg["arr"] + win_start_min
-                frm     = leg["from"]
-                to      = leg["to"]
-
-                if frm == base and home_arr is not None:
-                    if dep_abs - home_arr >= HOME_BREAK:
-                        reset_at = dep_abs
-                        last_day = -1
-                        worked   = 0
-                    home_arr = None
-
-                dep_day = dep_abs // 1440
-                if dep_day != last_day:
-                    worked  += 1
-                    last_day = dep_day
-
-                away = (dep_abs - reset_at) / 1440.0
-
-                if away > MAX_AWAY_DAYS or worked > MAX_WORK_DAY:
-                    cut_idx = i
-                    break
-
-                if to == base:
-                    home_arr = arr_abs
-
-            if cut_idx is not None and cut_idx > 0:
-                # Trim route to the legs before the first breach.
-                route["legs"] = legs[:cut_idx]
-                last_leg      = legs[cut_idx - 1]
-                end_airport   = last_leg["to"]
-                next_crew_positions[crew_id] = end_airport
-                route["hb_violations"] = viols
-                repaired += 1
-
-                # Update the crew's carry state to reflect the trimmed route.
-                _, new_state = self._check_home_break(
-                    route["legs"], base, win_start_min,
-                    carry_reset_at = prior.get('reset_at', 0),
-                    carry_last_day = prior.get('last_day', -1),
-                    carry_worked   = prior.get('worked',   0),
-                    carry_home_arr = prior.get('home_arr', None),
-                )
-                hb_states[crew_id] = new_state
-
-        if repaired:
-            print(f"  Home-break repair: trimmed {repaired} route(s) at violation point")
-
-        self._hb_states = hb_states
-        return routes
-
     def _trace_path(
         self,
         source: Node,
@@ -2621,9 +2442,6 @@ def solve_rolling_horizon(
             continue
 
         # ── Build position_supply from crew_positions (single source of truth) ──
-        # Derive {home_base: {airport: count}} directly from the per-crew
-        # endpoint map so the flow supply and route decomposition are always
-        # consistent — no separate _extract_end_positions needed here.
         if crew_positions is not None:
             win_position_supply: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
             base_map = {c.id: c.base for c in crew}
@@ -2668,7 +2486,6 @@ def solve_rolling_horizon(
             crew=crew,
             horizon_end=win_horizon_local,
             flight_end=win_commit_local,
-            time_bucket=TIME_BUCKET,
             verbose=verbose,
             window_offset=win_start,
             position_supply=win_position_supply,
@@ -2993,7 +2810,6 @@ def main(csv_path: str, days: int = DAYS_TO_SOLVE,
                 crew=crew,
                 horizon_end=horizon_end,
                 flight_end=flight_end,
-                time_bucket=TIME_BUCKET,
                 verbose=True,
             )
             net.build_initial_network()
