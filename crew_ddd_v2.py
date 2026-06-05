@@ -83,6 +83,14 @@ S_MIN = 5             # minimum crew at any base
 S_MAX = 40            # maximum crew (introduced by noise)
 RANDOM_SEED = 42
 
+# Crew base assignment (slide 12)
+MIN_CREW_PER_BASE     = S_MIN          # alias used by assign_crew_bases
+MAX_BASES: int | None = None           # None = no cap on number of bases
+BASE_SELECTION        = "demand"       # strategy: "demand" | "all"
+SATELLITE_RADIUS_MI   = 150.0          # max radius (mi) for satellite pre-positioning
+SATELLITE_MIN_FLIGHTS = 3              # min daily departures to qualify as satellite
+AIRPORT_COORDS_CSV: str | None = None  # optional CSV: IATA,lat,lon
+
 # Cost parameters (slide 10)
 C_FL  = 100.0         # per minute of flight time worked
 C_DH  = 20.0          # per minute of deadhead (base per-diem + opp-cost)
@@ -334,54 +342,175 @@ def classify_airports(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CREW BASE SIZING  (slide 12)
-# n_b = max(s_min, ceil( (Σ_{f: orig=b} r_f * δ_f / d_duty) * 1.5 ) + noise )
+# n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f * d_f / τ_duty) * 1.5 + noise ))
 # ─────────────────────────────────────────────────────────────────────────────
 
-def size_crew_bases(
+def _haversine_mi(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Great-circle distance in miles between two (lon, lat) points."""
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def assign_crew_bases(
     flights: list[Flight],
     seed: int = RANDOM_SEED,
+    max_bases: int | None = MAX_BASES,
+    strategy: str = BASE_SELECTION,
+    satellite_radius_mi: float = SATELLITE_RADIUS_MI,
+    satellite_min_flights: int = SATELLITE_MIN_FLIGHTS,
+    airport_coords_csv: str | None = AIRPORT_COORDS_CSV,
 ) -> list[CrewMember]:
     """
-    Implements the base-sizing formula from slide 12:
-      n_b = max(s_min, ceil((Σ_{f: orig=b} r_f * δ_f / d_duty) * 1.5) + noise)
+    Select crew bases and assign crew counts using the slide 12 formula:
+
+      n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f · d_f / τ_duty) · 1.5 + noise ))
+
+    where:
+      m_f      = flight.min_crew  (MIN_CABIN_CREW from input)
+      d_f      = flight.duration  (minutes)
+      τ_duty   = 8 h/day × horizon_days  (available duty-minutes per crew member)
+      noise    ~ Gauss(0, 0.10 × needed)
+
+    Hub airports are sized with the 1.5 buffer + noise.
+    Satellite airports (≤ satellite_radius_mi from a hub, ≥ satellite_min_flights/day)
+    are sized for local demand only with a 1.2 buffer and no noise.
 
     Key constraints:
-    - Bases are ONLY created at airports with originating flights (demand > 0).
-      Destination-only airports cannot be crew bases: a crew member there would
-      have no outgoing flight arcs from their home depot, making flow balance
-      (out - in = 1) immediately infeasible.
-    - S_MIN applies only to real origin airports, not the entire network.
+    - Only origin airports are eligible as bases (destination-only airports have no
+      outgoing arcs from the depot → flow balance infeasible).
+    - S_MIN (MIN_CREW_PER_BASE) applies to all bases.
+    - S_MAX caps the noisy draw to prevent runaway crew pools.
     """
     rng = random.Random(seed)
+    all_airports = sorted(set(f.origin for f in flights) | set(f.dest for f in flights))
 
-    # Only origin airports can be bases (slide 8: B ⊆ A)
-    origin_airports = sorted(set(f.origin for f in flights))
-
-    # d_duty: available duty minutes per crew member per planning horizon (slide 12)
-    # Use 8h/day as practical working utilisation (not the 14h legal maximum).
-    horizon_days = max(f.arr_min for f in flights) / 1440 if flights else 3
-    d_duty = 8 * 60 * max(1.0, horizon_days)
-
-    demand_min: dict[str, float] = defaultdict(float)
+    # Demand: Σ_{f: orig=p} m_f · d_f   (slide 12 numerator)
+    demand_minutes: dict[str, float] = defaultdict(float)
+    dep_count: dict[str, int] = defaultdict(int)
     for f in flights:
-        demand_min[f.origin] += f.min_crew * f.duration
+        demand_minutes[f.origin] += f.min_crew * f.duration
+        dep_count[f.origin] += 1
 
+    # Only origin airports can host bases
+    hub_airports = sorted(ap for ap in all_airports if demand_minutes[ap] > 0)
+    if max_bases is not None and len(hub_airports) > max_bases:
+        # Keep the max_bases airports with highest demand when a cap is requested
+        hub_airports = sorted(
+            hub_airports,
+            key=lambda ap: demand_minutes[ap],
+            reverse=True,
+        )[:max_bases]
+
+    # Optional coordinate data for satellite detection
+    coords: dict[str, tuple[float, float]] | None = None
+    if airport_coords_csv and os.path.exists(airport_coords_csv):
+        coords = {}
+        with open(airport_coords_csv, encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                iata = row.get("IATA", row.get("iata", "")).strip().upper()
+                try:
+                    coords[iata] = (float(row["lon"]), float(row["lat"]))
+                except (KeyError, ValueError):
+                    pass
+
+    # ── Satellite pre-positioning ─────────────────────────────────────────────
+    # A non-hub origin airport qualifies as a satellite if:
+    #   1. It has ≥ satellite_min_flights departures/day on average, AND
+    #   2. It lies within satellite_radius_mi of at least one hub (needs coords).
+    hub_set = set(hub_airports)
+    satellite_airports: dict[str, str] = {}   # satellite_ap -> nearest_hub
+
+    horizon_days = max(f.arr_min for f in flights) / 1440 if flights else 3
+
+    if coords:
+        for ap in all_airports:
+            if ap in hub_set or ap not in coords:
+                continue
+            if demand_minutes[ap] == 0:
+                continue
+            daily_deps = dep_count[ap] / max(1.0, horizon_days)
+            if daily_deps < satellite_min_flights:
+                continue
+            # Find nearest hub within radius
+            nearest = min(
+                (h for h in hub_airports if h in coords),
+                key=lambda h: _haversine_mi(*coords[ap], *coords[h]),
+                default=None,
+            )
+            if nearest is not None:
+                dist = _haversine_mi(*coords[ap], *coords[nearest])
+                if dist <= satellite_radius_mi:
+                    satellite_airports[ap] = nearest
+
+    # ── τ_duty: available duty-minutes per crew member  (slide 12 denominator) ─
+    # Use 8 h/day practical utilisation (not the 14 h legal maximum).
+    tau_duty = 8 * 60 * max(1.0, horizon_days)
+
+    # ── Size each base ────────────────────────────────────────────────────────
+    all_bases = sorted(hub_set | set(satellite_airports.keys()))
+    base_counts: dict[str, int] = {}
+
+    for ap in all_bases:
+        demand = demand_minutes.get(ap, 0.0)
+        if ap in satellite_airports:
+            # Satellites: local demand only, 1.2× buffer, no noise
+            needed = math.ceil((demand / tau_duty) * 1.2) if demand > 0 else MIN_CREW_PER_BASE
+            base_counts[ap] = max(MIN_CREW_PER_BASE, needed)
+        else:
+            # Hubs: slide 12 formula — 1.5× buffer + Gaussian noise
+            needed = math.ceil((demand / tau_duty) * 1.5) if demand > 0 else MIN_CREW_PER_BASE
+            noisy  = int(rng.gauss(needed, max(1, needed * 0.10)))
+            base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
+
+    # ── Build CrewMember list ─────────────────────────────────────────────────
     crew_list: list[CrewMember] = []
     cid = 0
-    for ap in origin_airports:
-        raw_demand = demand_min[ap]   # always > 0 since ap ∈ origin_airports
-        needed = math.ceil((raw_demand / d_duty) * 1.5)
-        noisy  = int(rng.gauss(needed, max(1, needed * 0.10)))
-        count  = max(S_MIN, min(S_MAX, noisy))
-        for _ in range(count):
+    for ap in sorted(all_bases):
+        for _ in range(base_counts[ap]):
             crew_list.append(CrewMember(id=cid, base=ap))
             cid += 1
 
-    total_demand = sum(demand_min.values())
-    print(f"  Created {len(crew_list):,} crew across {len(origin_airports)} origin bases "
-          f"(skipped {len(set(f.dest for f in flights) - set(origin_airports))} dest-only airports)")
-    print(f"  Total crew-minutes demand: {total_demand:,.0f}")
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+    total = len(crew_list)
+    n_hub_crew = sum(base_counts[ap] for ap in hub_airports if ap in base_counts)
+    n_sat_crew = sum(base_counts[ap] for ap in satellite_airports)
+    total_demand   = sum(demand_minutes.values())
+    total_available = sum(base_counts[ap] * tau_duty for ap in all_bases)
+
+    print(f"  Created {total:,} crew  "
+          f"({n_hub_crew} at {len(hub_airports)} hubs  +  "
+          f"{n_sat_crew} at {len(satellite_airports)} satellites)")
+    print(f"  Total crew-minutes needed :  {total_demand:,.0f}")
+    print(f"  Available crew-minutes    :  {total_available:,.0f}")
+    print(f"  Coverage ratio            :  {total_available / max(1, total_demand):.2f}x")
+
+    # Warn about airports that are far from every base (likely uncoverable)
+    if coords and hub_airports:
+        unreachable = [
+            ap for ap in all_airports
+            if ap not in set(all_bases)
+            and ap in coords
+            and min(
+                _haversine_mi(*coords[ap], *coords[h])
+                for h in hub_airports if h in coords
+            ) > satellite_radius_mi * 1.5
+        ]
+        if unreachable:
+            print(
+                f"  WARNING: {len(unreachable)} airports are >{satellite_radius_mi * 1.5:.0f} mi "
+                f"from any base (likely uncoverable): "
+                f"{sorted(unreachable, key=lambda a: dep_count.get(a, 0), reverse=True)[:8]}"
+            )
+
     return crew_list
+
+
+# Backwards-compatible alias so existing call sites need no changes.
+size_crew_bases = assign_crew_bases
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -668,21 +797,30 @@ class CrewDDDNetwork:
             self._add_node_sorted(Node(ap, DEPOT_START))
             self._add_node_sorted(Node(ap, self.horizon_end))
 
-        # 2. Departure-time nodes only (slide 14).
-        #    We insert dep times at both origin AND dest so that every airport
-        #    has nodes for every flight event touching it.
+        # 2. Insert event nodes for every flight (slide 14).
+        #    Origin gets a departure-time node so flight arcs can depart from it.
+        #    Destination gets an arrival-time node so _snap_arrival has something
+        #    to snap to — it searches for the first node at dest with
+        #    time >= arr_min + DELTA_TA.
         #
-        #    We do NOT pre-insert snapped arrival times (arr + Delta_ta).
-        #    The old code inserted (dest, arr+45) as a standalone node, which
-        #    sat outside the wait-arc chain if it didn't coincide with a
-        #    departure time or horizon node — leaving crew stranded with no
-        #    path home and making the horizon flow constraint permanently
-        #    infeasible. By inserting departure times only, the wait-arc chain
-        #    built in step 3 is guaranteed to connect every node to the horizon,
-        #    and _snap_arrival finds the next node already in that chain.
+        #    Previous code inserted Node(f.dest, f.dep_min) — the departure time
+        #    at the *destination* — which is semantically wrong.  For flights whose
+        #    arr_min + 45 fell after every such dep-time node at the dest airport,
+        #    _snap_arrival returned None and the arc was silently dropped, making
+        #    those flights structurally uncoverable regardless of crew supply.
+        #
+        #    We also insert the snapped node (arr_min + DELTA_TA) directly so that
+        #    _snap_arrival always finds an exact match on first call and the wait-arc
+        #    chain is already present for it.  This node sits in the wait-arc chain
+        #    because step 3 builds arcs between consecutive sorted nodes, so there
+        #    is always a path forward to the horizon.
         for f in self.flights:
             self._add_node_sorted(Node(f.origin, f.dep_min))
-            self._add_node_sorted(Node(f.dest,   f.dep_min))
+            self._add_node_sorted(Node(f.dest,   f.arr_min))
+            # Also pre-insert the turnaround-snapped node so snap_arrival hits exactly.
+            snap_t = f.arr_min + DELTA_TA
+            if snap_t <= self.horizon_end:
+                self._add_node_sorted(Node(f.dest, snap_t))
 
         if self.verbose:
             print(f"    Nodes after dep/arr: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
@@ -821,11 +959,10 @@ class CrewDDDNetwork:
         """
         Return True iff this crew member may use this arc.
 
-        Home-spine wait arcs (both endpoints at the crew's home airport) are
-        always allowed, regardless of the reachability set.  They form the
-        chain depot->...->horizon that every crew member must traverse, and
-        must never be blocked by a stale or temporarily incomplete reachability
-        computation (which would turn fb_depot_<c> into 0 = 1).
+        Home-spine wait arcs (both endpoints at the crew's home airport) bypass
+        the reachability check entirely.  They form the depot->...->horizon
+        chain every crew member must traverse, and must never be blocked by a
+        stale or incomplete reachability set.
         """
         if (arc.arc_type == 'wait'
                 and arc.start.airport == crew.base
@@ -947,7 +1084,7 @@ class CrewDDDNetwork:
                 n_iso_crew = sum(self.base_crew.get(b, 0) for b in isolated)
                 print(f"      Isolated: {isolated[:8]}"
                       f"{'…' if len(isolated) > 8 else ''}  "
-                      f"({n_iso_crew} crew will be dropped)")
+                      f"({n_iso_crew} crew — tier-1 drop: no flight/dh arcs reachable)")
 
             self._reachability_logged = True
 
@@ -967,46 +1104,52 @@ class CrewDDDNetwork:
         prev_node = ap_nodes[pos - 1] if pos > 0 else None
         next_node = ap_nodes[pos + 1] if pos + 1 < len(ap_nodes) else None
 
-        # Remove the old spanning wait arc BEFORE recomputing reachability so
-        # that Dijkstra does not traverse a stale arc that is about to be split.
+        # Step 1: Remove stale spanning wait arc before recomputing reachability
+        # so Dijkstra does not traverse an arc that is about to be split.
         if prev_node and prev_node in self.wait_arc_by_start:
-            old = self.wait_arc_by_start[prev_node]
-            if old.end.time >= new_node.time:   # old arc spans the new node
-                self._remove_arc(old)
+            old_arc = self.wait_arc_by_start[prev_node]
+            if old_arc.end.time >= new_node.time:
+                self._remove_arc(old_arc)
                 del self.wait_arc_by_start[prev_node]
 
-        # Recompute reachability NOW — after removing the stale arc but BEFORE
-        # creating the two replacement wait arcs — so that _make_arc's auto-wiring
-        # sees an up-to-date reachable set and correctly registers the new wait
-        # arcs for every crew member.  Doing this after _make_wait_arc (as the
-        # previous version did) left depot nodes with no outgoing variable,
-        # turning fb_depot_<c> into 0 = 1 and making Iter 1 infeasible.
+        # Step 2: Recompute reachability after removing the stale arc.
+        # new_node has no arcs yet so Dijkstra won't visit it -- that is fine;
+        # home-spine wait arcs bypass the reachability check in _crew_can_use_arc.
         if self.model is not None and self._base_reachable_arcs:
             _sv, self.verbose = self.verbose, False
             self._compute_base_reachability()
             self.verbose = _sv
 
-        # Now create the two replacement wait arcs; reachability is fresh so
-        # _make_arc will wire them into the model correctly.
+        # Step 3: Pre-create placeholder flow balance constraints for new_node.
+        # CRITICAL: these must exist before _make_wait_arc so that
+        # _add_arc_var_for_crew's chgCoeff calls for arc.end == new_node land
+        # on a real constraint instead of being silently dropped.
+        # Placeholder "0 == 0" is correct: new_node is never a depot or horizon
+        # (those exist from network build time), so its RHS is always 0.
+        # The actual arc variables are chgCoeff'd in as the wait/flight arcs run.
+        if self.model is not None:
+            for cid in list(self.flow_constrs):
+                if new_node not in self.flow_constrs[cid]:
+                    constr = self.model.addConstr(
+                        0.0 == 0.0,
+                        name=f"fb_{cid}_{new_node.airport}_{new_node.time}"
+                    )
+                    self.flow_constrs[cid][new_node] = constr
+
+        # Step 4: Create replacement wait arcs.
+        # Reachability is fresh and flow constraints exist for new_node,
+        # so _add_arc_var_for_crew can correctly wire variable coefficients.
         if prev_node:
             self._make_wait_arc(prev_node, new_node)
         if next_node:
             self._make_wait_arc(new_node, next_node)
 
-        # Add flow balance constraints for the new node for every crew member
-        # that already has a model variable touching it (via the newly created
-        # wait arcs or the flight arcs about to be exposed below).
-        if self.model is not None:
-            for cid in self.flow_constrs:
-                if new_node not in self.flow_constrs[cid]:
-                    self._add_flow_constr_for_crew(cid, new_node)
-
-        # Expose new flight/deadhead arcs departing from or arriving at new_node,
-        # then recompute reachability once more so subsequent add_node calls and
-        # _add_arc_var_for_crew see the newly reachable flight arcs.
+        # Step 5: Expose new flight/deadhead arcs at new_node.
         self._expose_flight_arcs_from(new_node)
         self._expose_flight_arcs_to(new_node)
 
+        # Step 6: Refresh reachability so subsequent add_node calls see the
+        # newly reachable flight arcs.
         if self.model is not None and self._base_reachable_arcs:
             _sv, self.verbose = self.verbose, False
             self._compute_base_reachability()
@@ -1058,28 +1201,52 @@ class CrewDDDNetwork:
         self._base_reachable_arcs = {}
         self._compute_base_reachability()
 
-        # ── Active crew: drop crew whose base cannot reach any coverage flight ─
-        # Crew at bases in disconnected network components (or bases with no path
-        # to any coverage flight) generate only wait-arc variables and contribute
-        # nothing to coverage constraints, while bloating the model with thousands
-        # of useless variables and flow-balance constraints.
+        # ── Active crew: drop crew whose base is structurally isolated ──────────
+        # Two-tier check:
+        #
+        # Tier 1 — Topologically isolated: base has zero reachable flight OR
+        #   deadhead arcs.  These crew can only sit on home-spine wait arcs and
+        #   contribute nothing.  This catches airports like COU/GRR/IND that appear
+        #   as origin airports in the data but have no connecting service in this
+        #   window's time-expanded graph.
+        #
+        # Tier 2 — Coverage-unreachable: base has some flight arcs but none of
+        #   them belong to F_cov (e.g. all reachable flights are in the lookahead
+        #   tail beyond t_commit).  These crew also contribute zero to coverage
+        #   constraints and would only bloat the model.
+        #
+        # Both tiers are dropped.  The diagnostic message distinguishes them.
         coverage_flight_ids = {f.id for f in self.cov_flights}
         active_crew = []
-        dropped_crew = 0
+        dropped_isolated = 0   # tier 1: no flight/dh arcs at all
+        dropped_no_cov   = 0   # tier 2: has arcs but can't reach any cov flight
         for c in self.crew:
             reachable = self._base_reachable_arcs.get(c.base, set())
+            flight_dh_arcs = [a for a in reachable
+                              if a.arc_type in ('flight', 'deadhead')]
+            if not flight_dh_arcs:
+                dropped_isolated += 1
+                continue
             can_cover = any(
                 a.arc_type == 'flight' and a.flight_id in coverage_flight_ids
-                for a in reachable
+                for a in flight_dh_arcs
             )
             if can_cover:
                 active_crew.append(c)
             else:
-                dropped_crew += 1
-        self.active_crew = active_crew  # stored for use in extract_solution etc.
-        if self.verbose and dropped_crew:
-            print(f"    Dropped {dropped_crew} crew with no path to any coverage flight "
-                  f"({len(active_crew)} active of {len(self.crew)} total)")
+                dropped_no_cov += 1
+        self.active_crew = active_crew
+        if self.verbose:
+            if dropped_isolated:
+                print(f"    Dropped {dropped_isolated} crew from isolated bases "
+                      f"(no reachable flight/deadhead arcs in this window)")
+            if dropped_no_cov:
+                print(f"    Dropped {dropped_no_cov} crew unreachable from any "
+                      f"coverage flight (arcs exist but not into F_cov)")
+            total_dropped = dropped_isolated + dropped_no_cov
+            if total_dropped:
+                print(f"    {len(active_crew)} active crew of {len(self.crew)} total "
+                      f"({total_dropped} dropped)")
 
         # ── Variables: x_{c,a} ∈ [0,1] (slide 25) ───────────────────────────
         total_vars = 0
@@ -1160,22 +1327,32 @@ class CrewDDDNetwork:
             print(f"    Flow balance constraints added  ({_t.time()-t0:.1f}s)")
 
         # ── Constraint 2': Coverage (slide 28) ───────────────────────────────
+        # Always add the constraint even when fl_arcs is empty.
+        # When empty: slack_var >= min_crew forces the full uncoverage penalty.
+        # Old code had `if not fl_arcs: continue` which left the slack
+        # unconstrained so Gurobi set it to 0 for free — flight looked covered.
+        n_no_arcs = 0
         for f in self.cov_flights:
             fl_arcs = [a for a in self._arcs_by_flight.get(f.id, [])
                        if a.arc_type == 'flight']
-            if not fl_arcs:
-                continue
-            cov_expr = gp.quicksum(
-                self.arc_var[c.id][arc]
-                for c in active_crew
-                for arc in fl_arcs
-                if arc in self.arc_var[c.id]
-            )
+            if fl_arcs:
+                cov_expr = gp.quicksum(
+                    self.arc_var[c.id][arc]
+                    for c in active_crew
+                    for arc in fl_arcs
+                    if arc in self.arc_var[c.id]
+                )
+            else:
+                cov_expr = 0.0
+                n_no_arcs += 1
             constr = self.model.addConstr(
                 cov_expr + self.slack_var[f.id] >= f.min_crew,
                 name=f"cov_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
+        if self.verbose and n_no_arcs:
+            print(f"    WARNING: {n_no_arcs} coverage flights have no reachable "
+                  f"flight arcs — will be uncovered (slack-only constraint added)")
 
         self.model.update()
         if self.verbose:
@@ -1190,10 +1367,8 @@ class CrewDDDNetwork:
         c = self.crew_by_id.get(crew_id)
         if c is None:
             return
-        # Re-check reachability here as a guard (the primary gate is
-        # _crew_can_use_arc in _make_arc; this handles arcs added via other
-        # paths such as DDD refinement).  The home-spine bypass lives in
-        # _crew_can_use_arc so it applies consistently everywhere.
+        # Delegate reachability check (including home-spine bypass) to
+        # _crew_can_use_arc so the logic lives in exactly one place.
         if not self._crew_can_use_arc(c, arc):
             return
         if crew_id not in self.arc_var:
@@ -1596,13 +1771,43 @@ def save_result(
     airline: str,
     window_idx: int,
     out_dir: str = ".",
+    coverage_days: int = 0,
+    horizon_end: int = 0,
 ):
-    """Save window result to JSON for downstream visualisation."""
+    """Save window result to JSON for downstream visualisation.
+
+    Output format matches flights_mini_result.json exactly so FlightViz can
+    load either file without changes.  Key invariant: flights[i].id == i
+    (0-based sequential), and every route leg's flight_id is remapped to that
+    same 0-based index.  The viz uses flights[flight_id] as an array lookup,
+    so non-sequential internal IDs (e.g. 4485, 23329) would silently miss.
+    """
+    # Build a remap from internal flight id -> 0-based sequential index.
+    # cov_flights are the only flights in the flights[] array; legs that
+    # reference horizon flights outside this set keep their original id
+    # (they won't match anything in flights[], which is fine — the viz just
+    # won't draw them, and they're only deadhead repositioning moves anyway).
+    id_remap = {f.id: i for i, f in enumerate(cov_flights)}
+
+    # Remap leg flight_ids and ensure every route has crew_count.
+    routes = []
+    for r in result.get("routes", []):
+        new_legs = []
+        for leg in r.get("legs", []):
+            new_leg = dict(leg)
+            if leg["flight_id"] in id_remap:
+                new_leg["flight_id"] = id_remap[leg["flight_id"]]
+            new_legs.append(new_leg)
+        entry = dict(r)
+        entry["legs"] = new_legs
+        entry.setdefault("crew_count", 1)
+        routes.append(entry)
+
     payload = {
         "meta": {
-            "airline": airline,
-            "window": window_idx,
-            "solve_status": result.get("status", "unknown"),
+            "days": coverage_days,
+            "horizon_end": horizon_end,
+            "solve_status": "rolling_horizon",
             "total_cost": result.get("cost") or 0.0,
             "flight_cost": result.get("flight_cost", 0.0),
             "deadhead_cost": result.get("deadhead_cost", 0.0),
@@ -1614,14 +1819,15 @@ def save_result(
         "crew": [{"id": c.id, "base": c.base} for c in crew],
         "flights": [
             {
-                "id": f.id, "flight_num": f.flight_num,
+                "id": i,                          # 0-based; must match leg flight_id
+                "flight_num": f.flight_num,
                 "origin": f.origin, "dest": f.dest,
                 "dep_min": f.dep_min, "arr_min": f.arr_min,
                 "duration": f.duration, "min_crew": f.min_crew,
             }
-            for f in cov_flights
+            for i, f in enumerate(cov_flights)
         ],
-        "routes": result.get("routes", []),
+        "routes": routes,
         "uncovered_flights": [
             {
                 "flight_num": f.flight_num, "origin": f.origin, "dest": f.dest,
@@ -1712,7 +1918,8 @@ def solve_airline(
               f"covered={result.get('covered_flights', 0)}/{result.get('num_flights', 0)}  "
               f"time={t1-t0:.1f}s")
 
-        save_result(result, f_cov, crew, airline, win.idx, out_dir)
+        save_result(result, f_cov, crew, airline, win.idx, out_dir,
+                     coverage_days=coverage_days, horizon_end=win.t_hor)
         all_results.append({"window": win.idx, **result})
 
     return all_results
