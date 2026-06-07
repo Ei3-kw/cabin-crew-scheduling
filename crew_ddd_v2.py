@@ -585,9 +585,24 @@ def compute_reachable(
                 if new_dw > D_WORK:
                     continue
 
-                # d_away: time since last home touch must not exceed DELTA_AWAY
+                # d_away: time since last home touch must not exceed DELTA_AWAY.
+                #
+                # FIX (stranding away from base): the old prune dropped EVERY
+                # flight/deadhead arc once time_away exceeded the cap — including the
+                # arc that would carry the crew HOME.  A crew that drifted even one
+                # leg over the limit therefore had no legal move and was parked at a
+                # spoke for days (e.g. 10.5d at MLI), which both wastes the crew and
+                # shows up as a d_away violation that never resolves until a later
+                # window happens to open a path.
+                #
+                # We now keep any arc whose destination IS the home base reachable
+                # regardless of time_away, so a crew is ALWAYS able to route home
+                # (arriving at most one leg late).  Arcs that travel further away are
+                # still pruned, which bounds the overage to a single home-bound leg.
                 time_away = arc.true_end - new_tlh
-                if arc.arc_type in ('flight', 'deadhead') and time_away > DELTA_AWAY:
+                if (arc.arc_type in ('flight', 'deadhead')
+                        and time_away > DELTA_AWAY
+                        and arc.end.airport != base_airport):
                     continue
 
                 nd = d + arc.cost
@@ -2012,6 +2027,34 @@ class CrewDDDNetwork:
                     # trip started so its full length is measured.
                     start_ap = self.crew_start_airport.get(c.id, c.base)
                     prev_clock = self.carry_clocks.get(c.id, ClockState())
+
+                    # ── d_away cross-window continuity ─────────────────────────
+                    # Seed last_home_return from the carried-in clock so the away
+                    # budget (arc.true_end - t_last_home_return) is CONTINUOUS
+                    # across window boundaries.
+                    #
+                    # BUG (fixed here): last_home_return was initialised to -LARGE
+                    # every window and only updated from arcs whose end.airport is
+                    # the base.  A crew that began the window AT home and departed
+                    # produced no committed arc *ending* at base, so last_home_return
+                    # stayed -LARGE.  The next window then saw t_last_home_return < 0,
+                    # took the `init_t_last_home < 0` branch in compute_reachable, and
+                    # RESET the away clock to that window's t_start — handing the crew
+                    # a fresh 4-day budget at every boundary.  Away-spells therefore
+                    # leaked up to (commit-period + D_AWAY) days (observed 5-6 day
+                    # spells against a 4-day cap), which in turn forced clustered 48h
+                    # home breaks that stranded small bases (e.g. MHK #6141 uncovered).
+                    if start_ap == c.base:
+                        # Crew is at home at the window start: their last home touch is
+                        # at least t_start.  Forward home-wait arcs below bump this up
+                        # toward the actual departure time when they exist.
+                        last_home_return = max(prev_clock.t_last_home_return,
+                                               self.win.t_start)
+                    else:
+                        # Crew starts away: inherit the previous window's last home
+                        # touch so the budget keeps counting down, not restarting.
+                        last_home_return = prev_clock.t_last_home_return
+
                     if start_ap != c.base:
                         away_since = (prev_clock.away_since
                                       if prev_clock.away_since > -LARGE
