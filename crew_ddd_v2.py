@@ -148,6 +148,13 @@ LARGE = int(1e9)
 # Overnight threshold (4 h = 240 min)
 OVERNIGHT_THRESHOLD = 4 * 60
 
+# Home-return deadhead discount.
+# A deadhead arc whose destination is the crew's home base is discounted by this
+# fraction relative to the standard deadhead cost.  This incentivises satellite /
+# regional crew (e.g. ALO, ATW) to route home rather than be sent to yet another
+# outstation — without changing the hard constraints.  Set to 0.0 to disable.
+C_DH_HOME_RETURN_DISCOUNT = 0.30   # 30 % cheaper to deadhead home
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA STRUCTURES
@@ -584,12 +591,21 @@ def _opp_cost_scale(lf: float) -> float:
     return (lf - LF_LOW) / (LF_HIGH - LF_LOW)
 
 
-def deadhead_cost(f: Flight) -> float:
-    """c_dh^a for deadhead arc on flight f (slide 10)."""
+def deadhead_cost(f: Flight, home_base: str = "") -> float:
+    """c_dh^a for deadhead arc on flight f (slide 10).
+
+    If home_base is provided and f.dest == home_base, apply a cost discount so
+    that the solver prefers routing satellite / regional crew home over sending
+    them to yet another outstation.  The discount is purely a cost signal; the
+    hard flow-balance and d_away constraints remain unchanged.
+    """
     base = f.duration * C_DH
     fare = FARE_BASE + FARE_PER_MILE * max(0.0, f.distance)
     opp  = fare * _opp_cost_scale(f.load_factor)
-    return base + opp
+    cost = base + opp
+    if home_base and f.dest == home_base:
+        cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
+    return cost
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1461,14 +1477,29 @@ class CrewDDDNetwork:
                       f"({total_dropped} dropped)")
 
         # ── Variables: x_{c,a} ∈ [0,1] (slide 25) ───────────────────────────
+        # Arc cost is adjusted per crew: a deadhead arc whose destination is the
+        # crew's home base is discounted by C_DH_HOME_RETURN_DISCOUNT so the solver
+        # prefers routing satellite / regional crew home over sending them onward.
+        # The discount is encoded in each variable's obj coefficient so it flows
+        # through to the Gurobi objective without changing the shared arc.cost.
         total_vars = 0
+        # Pre-build flight lookup: flight_id -> Flight object, for home-return check
+        _flight_by_id: dict[int, Flight] = {f.id: f for f in self.flights}
         for c in active_crew:
             self.arc_var[c.id] = {}
             self.flow_constrs[c.id] = {}
             for arc in self.arcs:
                 if self._crew_can_use_arc(c, arc):
+                    cost = arc.cost
+                    # Home-return deadhead discount
+                    if (arc.arc_type == 'deadhead'
+                            and arc.flight_id is not None
+                            and C_DH_HOME_RETURN_DISCOUNT > 0):
+                        fl = _flight_by_id.get(arc.flight_id)
+                        if fl is not None and fl.dest == c.base:
+                            cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
                     var = self.model.addVar(
-                        lb=0.0, ub=1.0, obj=arc.cost,
+                        lb=0.0, ub=1.0, obj=cost,
                         vtype=GRB.CONTINUOUS,
                         name=f"x_{c.id}_{arc.id}",
                     )
@@ -1732,7 +1763,16 @@ class CrewDDDNetwork:
         )
         ub = 0.0 if is_embargoed else 1.0
 
-        var = self.model.addVar(lb=0.0, ub=ub, obj=arc.cost,
+        # Home-return deadhead discount (same logic as in build_model variable creation)
+        cost = arc.cost
+        if (arc.arc_type == 'deadhead'
+                and arc.flight_id is not None
+                and C_DH_HOME_RETURN_DISCOUNT > 0):
+            fl = next((f for f in self.flights if f.id == arc.flight_id), None)
+            if fl is not None and fl.dest == c.base:
+                cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
+
+        var = self.model.addVar(lb=0.0, ub=ub, obj=cost,
                                 vtype=GRB.CONTINUOUS,
                                 name=f"x_{crew_id}_{arc.id}")
         self.model.update()  # flush so chgCoeff sees the new variable immediately
@@ -1921,7 +1961,7 @@ class CrewDDDNetwork:
         for it in range(max_iter):
             self.model.setObjective(
                 gp.quicksum(
-                    arc.cost * var
+                    var.Obj * var
                     for cvars in self.arc_var.values()
                     for arc, var in cvars.items()
                 ) + gp.quicksum(C_UNC_EFFECTIVE * v for v in self.slack_var.values()),
@@ -1979,7 +2019,7 @@ class CrewDDDNetwork:
         self.make_integer()
         self.model.setObjective(
             gp.quicksum(
-                arc.cost * var
+                var.Obj * var
                 for cvars in self.arc_var.values()
                 for arc, var in cvars.items()
             ) + gp.quicksum(C_UNC_EFFECTIVE * v for v in self.slack_var.values()),
@@ -2194,6 +2234,22 @@ class CrewDDDNetwork:
                         last_d_work = 0   # rest completed before window boundary
                     else:
                         last_d_work = len(duty_days_set)
+
+                    # ── Tail scan for last home return ─────────────────────────
+                    # The committed-arc walk above only tracks home returns with
+                    # arc.end.time <= t_commit.  If the crew planned a home return
+                    # in the tail (t_commit < end.time <= t_hor), that timestamp
+                    # was never recorded so the next window saw init_t_last_home=-1
+                    # and granted a fresh D_AWAY budget — allowing indefinite non-
+                    # return.  Fix: also scan tail arcs for home arrivals.
+                    # We do NOT update last_airport from tail arcs (that would
+                    # teleport the crew to a planned-but-not-yet-committed position);
+                    # we only update last_home_return so the away clock is correct.
+                    for arc in active_arcs:
+                        if arc.end.time <= t_commit:
+                            continue   # already handled in the committed walk
+                        if arc.end.airport == c.base:
+                            last_home_return = max(last_home_return, arc.true_end)
 
                     # NOTE: we do NOT look into the tail (t > t_commit) to find a
                     # planned home return and pre-emptively mark the crew as home.
