@@ -19,14 +19,13 @@ Key additions vs original:
     dest satisfying the MIN_TURNAROUND gap (slide 17).
   - Home-break clocks: per-crew state (t_reset, d_work, h_home) carried forward
     across windows (slide 23).
-  - Satellite airports S ⊆ A \ B: airports with ≤250 nm average distance and
-    ≥3 daily flights (used for reachability but not base-sized separately).
+  - Bases: every airport with flights both TO and FROM in the chosen airline
+    is a full crew base; there is no separate satellite class.
   - Cost constants aligned with slide 10 exactly.
 
 Sets & notation (slide 8–12):
   A      All airports
-  B ⊆ A  Crew home bases
-  S ⊆ A\B Satellite airports
+  B ⊆ A  Crew home bases (= every airport with flights to & from)
   C      Crew members
   C_b    Crew at base b
   F      All flights
@@ -39,7 +38,7 @@ Parameters (slides 9–11):
   l_f    Passenger load factor ∈ [0,1]
   r_f    Required working crew count
   s_b    Crew supply at base b
-  s_min=2, s_max=120
+  s_min=3, s_max=120
   c_fl   = 100 / min  (flight time worked)
   c_dh   = 20 / min   (deadhead base per-diem)
   c_wt   = 0.5 / min  (wait cost rate)
@@ -84,22 +83,13 @@ T_DAYS_TAIL    = 7    # return tail days
 T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 
 # Crew limits (slide 9)
-S_MIN = 2             # minimum crew at any base — 2 not 5: ensures a backup crew
-                      # is available when the primary crew member is on home break
-                      # (48h), while avoiding the original S_MIN=5 problem of
-                      # flooding regional bases (peak demand=1) with 5 crew who
-                      # have no local work and get drafted as ORD labour for 30 days
+S_MIN = 3             # minimum crew at any base 3
 S_MAX = 120           # maximum crew at any single base (raised to allow ORD to be
                       # correctly staffed: ORD carries ~49% of all flights)
 RANDOM_SEED = 42
 
 # Crew base assignment (slide 12)
-MIN_CREW_PER_BASE     = S_MIN          # alias used by assign_crew_bases
-MAX_BASES: int | None = None           # None = no cap on number of bases
-BASE_SELECTION        = "demand"       # strategy: "demand" | "all"
-SATELLITE_RADIUS_MI   = 150.0          # max radius (mi) for satellite pre-positioning
-SATELLITE_MIN_FLIGHTS = 3              # min daily departures to qualify as satellite
-AIRPORT_COORDS_CSV: str | None = None  # optional CSV: IATA,lat,lon
+MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
 
 # Crew utilisation discount for tau_duty (slide 12 denominator).
 # The raw formula tau = 8h * horizon_days assumes each crew works 8h every day,
@@ -128,9 +118,6 @@ DELTA_AWAY  = D_AWAY * 1440  # in minutes
 
 C_UNC_EFFECTIVE = 10**8
 
-# Satellite airport thresholds
-SAT_MAX_DIST   = 250.0  # nm; airports with avg great-circle ≤ this
-SAT_MIN_FLIGHTS = 3     # minimum daily flights
 
 # DDD solver (slide 11)
 DELTA_BUCKET = 15     # initial time-bucket (min)
@@ -150,7 +137,7 @@ OVERNIGHT_THRESHOLD = 4 * 60
 
 # Home-return deadhead discount.
 # A deadhead arc whose destination is the crew's home base is discounted by this
-# fraction relative to the standard deadhead cost.  This incentivises satellite /
+# fraction relative to the standard deadhead cost.  This incentivises regional /
 # regional crew (e.g. ALO, ATW) to route home rather than be sent to yet another
 # outstation — without changing the hard constraints.  Set to 0.0 to disable.
 C_DH_HOME_RETURN_DISCOUNT = 0.30   # 30 % cheaper to deadhead home
@@ -219,6 +206,11 @@ class ClockState:
     h_home: int             = 0      # home-wait accumulated since last departure (min)
     t_last_home_return: int = -LARGE # absolute minute of last arrival at home base;
                                      # -LARGE means never returned (no prior break needed)
+    away_since: int = -LARGE         # absolute minute the crew last departed home (start
+                                     # of the current away spell); -LARGE = at/based home
+    home_break_until: int = -LARGE   # if the last COMPLETED away-trip reached the D_AWAY
+                                     # cap, the crew owes a 48h home break until this
+                                     # minute; -LARGE = no break owed (short trips)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,107 +328,46 @@ def parse_flights_by_airline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SATELLITE AIRPORTS  (slide 8: S ⊆ A \ B)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def classify_airports(
-    flights: list[Flight],
-    bases: set[str],
-    days: int,
-) -> tuple[set[str], set[str]]:
-    """
-    Return (B_final, S_final) where:
-      B = bases (all airports with crew)
-      S = satellite airports: avg dist ≤ SAT_MAX_DIST AND ≥ SAT_MIN_FLIGHTS/day
-    """
-    from collections import Counter
-    ap_flights: dict[str, list[Flight]] = defaultdict(list)
-    for f in flights:
-        ap_flights[f.origin].append(f)
-
-    satellite: set[str] = set()
-    for ap, flist in ap_flights.items():
-        if ap in bases:
-            continue
-        avg_dist = sum(f.distance for f in flist) / len(flist) if flist else LARGE
-        daily_avg = len(flist) / max(1, days)
-        if avg_dist <= SAT_MAX_DIST and daily_avg >= SAT_MIN_FLIGHTS:
-            satellite.add(ap)
-
-    return bases, satellite
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # CREW BASE SIZING  (slide 12)
 # n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f * d_f / τ_duty) * 1.5 + noise ))
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _haversine_mi(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Great-circle distance in miles between two (lon, lat) points."""
-    R = 3958.8
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
 def assign_crew_bases(
     flights: list[Flight],
     seed: int = RANDOM_SEED,
-    max_bases: int | None = MAX_BASES,
-    strategy: str = BASE_SELECTION,
-    satellite_radius_mi: float = SATELLITE_RADIUS_MI,
-    satellite_min_flights: int = SATELLITE_MIN_FLIGHTS,
-    airport_coords_csv: str | None = AIRPORT_COORDS_CSV,
 ) -> list[CrewMember]:
     """
-    Select crew bases and assign crew counts.
+    Build the crew pool.
 
-    Sizing uses the larger of two estimates per base:
+    Base set B: every airport the chosen airline operates flights both TO and
+    FROM (i.e. it appears as an origin AND as a destination).  There is no
+    separate satellite / hub distinction any more — every such airport is a full
+    crew base.
 
-    (A) Duration-weighted demand (slide 12 formula):
-          n_demand = ceil( (Σ_{f: orig=p} m_f·d_f / τ_duty) · buffer )
-        where τ_duty = 8h/day · horizon_days · CREW_UTILISATION
-        The utilisation discount (~0.55) accounts for home-break (48h),
-        consecutive-day limits (D_WORK=3), and rest requirements eating
-        into theoretical crew availability.
-
-    (B) Peak concurrent crew demand:
-          n_peak = max over all t of Σ_{f departing at t from p} m_f
-        This catches high-frequency hubs (e.g. ORD) where individual
-        flights are short but many depart simultaneously.
-
-    Final count = max(S_MIN, min(S_MAX, max(n_demand, n_peak) · buffer + noise))
-
-    Key changes vs old formula:
-    - CREW_UTILISATION discount in tau_duty prevents chronic ORD understaffing
-    - S_MIN=1 (not 5): prevents regional bases with peak demand=1 from getting
-      5 crew who have no local work and get drafted as ORD labour for 30 days
-    - S_MAX=120: allows ORD to be correctly staffed (~49% of all flights)
-    - Peak concurrent demand as floor prevents the duration formula from giving
-      zero crew to a base that has several simultaneous flights of short duration
+    Per-base crew count:
+        n = max(S_MIN, min(S_MAX, ceil(max(n_demand, n_peak) * 1.5) + noise))
+      n_demand = (Sum_{f: orig=p} m_f * d_f) / tau_duty   (duration-weighted demand)
+      n_peak   = max simultaneous crew load over the horizon (peak concurrent)
+      tau_duty = 8h/day * horizon_days * CREW_UTILISATION
     """
     rng = random.Random(seed)
-    all_airports = sorted(set(f.origin for f in flights) | set(f.dest for f in flights))
 
-    # Demand: Σ_{f: orig=p} m_f · d_f   (slide 12 numerator)
+    origins = set(f.origin for f in flights)
+    dests   = set(f.dest   for f in flights)
+    # A base is any airport with flights both to AND from it in this airline.
+    bases = sorted(origins & dests)
+
+    # Demand:  Sum_{f: orig=p} m_f * d_f   (slide 12 numerator)
     demand_minutes: dict[str, float] = defaultdict(float)
-    dep_count: dict[str, int] = defaultdict(int)
     for f in flights:
         demand_minutes[f.origin] += f.min_crew * f.duration
-        dep_count[f.origin] += 1
 
-    # Peak concurrent crew demand per origin airport.
-    # For each base, sweep all flight events (dep=+crew, arr=-crew) and record
-    # the maximum simultaneous crew load.  This is the hard floor: you need at
-    # least this many crew available at this airport at the same time.
-    peak_concurrent: dict[str, int] = defaultdict(int)
-    from collections import defaultdict as _dd
-    events_by_ap: dict[str, list[tuple[int, int]]] = _dd(list)
+    # Peak concurrent crew demand per airport (dep = +crew, arr = -crew sweep).
+    events_by_ap: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for f in flights:
-        events_by_ap[f.origin].append((f.dep_min,  +f.min_crew))
-        events_by_ap[f.origin].append((f.arr_min,  -f.min_crew))
+        events_by_ap[f.origin].append((f.dep_min, +f.min_crew))
+        events_by_ap[f.origin].append((f.arr_min, -f.min_crew))
+    peak_concurrent: dict[str, int] = defaultdict(int)
     for ap, evts in events_by_ap.items():
         cur = pk = 0
         for _, delta in sorted(evts):
@@ -444,133 +375,45 @@ def assign_crew_bases(
             pk = max(pk, cur)
         peak_concurrent[ap] = pk
 
-    # Only origin airports can host bases
-    hub_airports = sorted(ap for ap in all_airports if demand_minutes[ap] > 0)
-    if max_bases is not None and len(hub_airports) > max_bases:
-        hub_airports = sorted(
-            hub_airports,
-            key=lambda ap: demand_minutes[ap],
-            reverse=True,
-        )[:max_bases]
-
-    # Optional coordinate data for satellite detection
-    coords: dict[str, tuple[float, float]] | None = None
-    if airport_coords_csv and os.path.exists(airport_coords_csv):
-        coords = {}
-        with open(airport_coords_csv, encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                iata = row.get("IATA", row.get("iata", "")).strip().upper()
-                try:
-                    coords[iata] = (float(row["lon"]), float(row["lat"]))
-                except (KeyError, ValueError):
-                    pass
-
-    # ── Satellite pre-positioning ─────────────────────────────────────────────
-    hub_set = set(hub_airports)
-    satellite_airports: dict[str, str] = {}   # satellite_ap -> nearest_hub
-
     horizon_days = max(f.arr_min for f in flights) / 1440 if flights else 3
-
-    if coords:
-        for ap in all_airports:
-            if ap in hub_set or ap not in coords:
-                continue
-            if demand_minutes[ap] == 0:
-                continue
-            daily_deps = dep_count[ap] / max(1.0, horizon_days)
-            if daily_deps < satellite_min_flights:
-                continue
-            nearest = min(
-                (h for h in hub_airports if h in coords),
-                key=lambda h: _haversine_mi(*coords[ap], *coords[h]),
-                default=None,
-            )
-            if nearest is not None:
-                dist = _haversine_mi(*coords[ap], *coords[nearest])
-                if dist <= satellite_radius_mi:
-                    satellite_airports[ap] = nearest
-
-    # ── τ_duty: utilisation-discounted available duty-minutes per crew member ──
-    # 8h/day * horizon_days is the theoretical maximum.  CREW_UTILISATION (~0.55)
-    # discounts for home-break obligations, consecutive-day limits, and rest gaps.
     tau_duty = 8 * 60 * max(1.0, horizon_days) * CREW_UTILISATION
 
-    # ── Size each base ────────────────────────────────────────────────────────
-    all_bases = sorted(hub_set | set(satellite_airports.keys()))
     base_counts: dict[str, int] = {}
-
-    for ap in all_bases:
-        demand = demand_minutes.get(ap, 0.0)
-        peak   = peak_concurrent.get(ap, 0)
-
-        if ap in satellite_airports:
-            # Satellites: take max of duration formula and peak, 1.2x buffer, no noise
-            n_demand = math.ceil((demand / tau_duty) * 1.2) if demand > 0 else 0
-            n_peak   = math.ceil(peak * 1.2)
-            needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
-            base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, needed))
-        else:
-            # Hubs: take max of duration formula and peak, 1.5x buffer + noise.
-            # 1.5x accounts for the fact that home-break obligations,
-            # consecutive-day limits, and rest gaps mean crew are only scheduleable
-            # ~55% of the horizon — the CREW_UTILISATION discount in tau_duty handles
-            # the denominator, but the numerator buffer must also be generous enough
-            # that the solver has slack to satisfy all rest constraints simultaneously.
-            n_demand = math.ceil((demand / tau_duty) * 1.5) if demand > 0 else 0
-            n_peak   = math.ceil(peak * 1.5)
-            needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
-            noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
-            base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
+    for ap in bases:
+        demand   = demand_minutes.get(ap, 0.0)
+        peak     = peak_concurrent.get(ap, 0)
+        n_demand = math.ceil((demand / tau_duty) * 1.5) if demand > 0 else 0
+        n_peak   = math.ceil(peak * 1.5)
+        needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
+        noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
+        base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
 
     # ── Build CrewMember list ─────────────────────────────────────────────────
     crew_list: list[CrewMember] = []
     cid = 0
-    for ap in sorted(all_bases):
+    for ap in bases:
         for _ in range(base_counts[ap]):
             crew_list.append(CrewMember(id=cid, base=ap))
             cid += 1
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
-    total = len(crew_list)
-    n_hub_crew = sum(base_counts[ap] for ap in hub_airports if ap in base_counts)
-    n_sat_crew = sum(base_counts[ap] for ap in satellite_airports)
+    total           = len(crew_list)
     total_demand    = sum(demand_minutes.values())
-    total_available = sum(base_counts[ap] * tau_duty for ap in all_bases)
-
-    print(f"  Created {total:,} crew  "
-          f"({n_hub_crew} at {len(hub_airports)} hubs  +  "
-          f"{n_sat_crew} at {len(satellite_airports)} satellites)")
+    total_available = sum(base_counts[ap] * tau_duty for ap in bases)
+    print(f"  Created {total:,} crew at {len(bases)} bases "
+          f"(every airport with flights to & from in this airline)")
     print(f"  Utilisation discount      :  {CREW_UTILISATION:.0%}  "
           f"(tau_duty = {tau_duty/60:.0f}h per crew over {horizon_days:.0f}d horizon)")
     print(f"  Total crew-minutes needed :  {total_demand:,.0f}")
     print(f"  Available crew-minutes    :  {total_available:,.0f}")
     print(f"  Coverage ratio            :  {total_available / max(1, total_demand):.2f}x")
 
-    # Per-base sizing breakdown for the top 10 bases by crew count
     top_bases = sorted(base_counts, key=lambda x: -base_counts[x])[:10]
     print(f"  Top bases by crew count:")
     for ap in top_bases:
-        peak = peak_concurrent.get(ap, 0)
-        print(f"    {ap}: {base_counts[ap]} crew  (peak concurrent={peak}, "
-              f"demand={demand_minutes.get(ap,0):,.0f} min)")
-
-    # Warn about airports far from every base (likely uncoverable)
-    if coords and hub_airports:
-        unreachable = [
-            ap for ap in all_airports
-            if ap not in set(all_bases)
-            and ap in coords
-            and min(
-                _haversine_mi(*coords[ap], *coords[h])
-                for h in hub_airports if h in coords
-            ) > satellite_radius_mi * 1.5
-        ]
-        if unreachable:
-            print(
-                f"  WARNING: {len(unreachable)} airports are >{satellite_radius_mi * 1.5:.0f} mi "
-                f"from any base (likely uncoverable): "
-                f"{sorted(unreachable, key=lambda a: dep_count.get(a, 0), reverse=True)[:8]}"
-            )
+        print(f"    {ap}: {base_counts[ap]} crew  "
+              f"(peak concurrent={peak_concurrent.get(ap, 0)}, "
+              f"demand={demand_minutes.get(ap, 0):,.0f} min)")
 
     return crew_list
 
@@ -595,7 +438,7 @@ def deadhead_cost(f: Flight, home_base: str = "") -> float:
     """c_dh^a for deadhead arc on flight f (slide 10).
 
     If home_base is provided and f.dest == home_base, apply a cost discount so
-    that the solver prefers routing satellite / regional crew home over sending
+    that the solver prefers routing regional / spoke crew home over sending
     them to yet another outstation.  The discount is purely a cost signal; the
     hard flow-balance and d_away constraints remain unchanged.
     """
@@ -690,27 +533,30 @@ def compute_reachable(
 
     def dijkstra_fwd(sources: list[Node]) -> set[Node]:
         dist = {n: INF for n in node_set}
-        # State: (cost, d_work_days, t_last_home, node)
-        # t_last_home = absolute minute when crew last touched home base
+        # State: (cost, d_work_DAYS, t_last_home, last_fly_day, node)
+        #   d_work_DAYS  : consecutive DUTY DAYS since the last home touch
+        #   last_fly_day : calendar day (//1440) of the most recent flight, or -1
+        # FIX: d_work counts DUTY DAYS, not flight legs.  Several flights on the
+        # same calendar day are ONE duty day (this matches compute_carry_over,
+        # which counts distinct departure days).  The previous version did
+        # `new_dw = dw + 1` per flight arc, so a regional crew flying 3-4 short
+        # legs in a single day hit D_WORK within that one day and had the rest of
+        # its day (and onward connections) pruned -- a major source of stranding.
         pq = []
         for s in sources:
             dist[s] = 0.0
             # Honour carry-over away clock.
-            # If the crew starts at home (or no base tracking), reset t_last_home
-            # to the depot time so the away budget starts fresh.
-            # If they start away from home, use init_t_last_home so the D_AWAY
-            # budget is correctly consumed from how long they've already been out.
             if not base_airport or s.airport == base_airport or init_t_last_home < 0:
                 t_last_home = s.time
             else:
                 t_last_home = init_t_last_home
-            heapq.heappush(pq, (0.0, init_dwork, t_last_home, s))
+            heapq.heappush(pq, (0.0, init_dwork, t_last_home, -1, s))
         visited: dict[Node, tuple] = {}
         while pq:
-            d, dw, tlh, u = heapq.heappop(pq)
+            d, dw, tlh, lfd, u = heapq.heappop(pq)
             if u in visited:
                 continue
-            visited[u] = (dw, tlh)
+            visited[u] = (dw, tlh, lfd)
             for arc in arcs_from.get(u, []):
                 v = arc.end
                 if v not in node_set:
@@ -721,11 +567,19 @@ def compute_reachable(
                 else:
                     new_tlh = tlh
 
-                # d_work: max consecutive flight-days (reset on home wait)
+                # d_work: consecutive DUTY DAYS (reset on a home wait/touch)
+                new_lfd = lfd
                 if arc.arc_type == 'flight':
-                    new_dw = dw + 1
-                elif arc.arc_type == 'wait' and base_airport and arc.end.airport == base_airport:
-                    new_dw = 0   # rest at home resets consecutive work counter
+                    dep_day = arc.start.time // 1440
+                    if dep_day != lfd:
+                        new_dw = dw + 1          # first flight of a new calendar day
+                        new_lfd = dep_day
+                    else:
+                        new_dw = dw              # same day -> same duty day
+                elif (arc.arc_type == 'wait' and base_airport
+                      and arc.end.airport == base_airport):
+                    new_dw = 0                   # rest at home resets the streak
+                    new_lfd = -1
                 else:
                     new_dw = dw
                 if new_dw > D_WORK:
@@ -739,7 +593,7 @@ def compute_reachable(
                 nd = d + arc.cost
                 if nd < dist.get(v, INF):
                     dist[v] = nd
-                    heapq.heappush(pq, (nd, new_dw, new_tlh, v))
+                    heapq.heappush(pq, (nd, new_dw, new_tlh, new_lfd, v))
         return {n for n, d in dist.items() if d < INF}
 
     def dijkstra_bwd(sources: list[Node]) -> set[Node]:
@@ -986,10 +840,12 @@ class CrewDDDNetwork:
         # 3. Wait arcs: chain consecutive nodes at each airport (slide 15).
         #    Every airport's timeline now ends at its horizon node (for bases)
         #    so wait arcs fully connect each node to the horizon.
+        base_airports_set = set(c.base for c in self.crew)
         for ap in self.nodes_by_airport:
             ap_nodes = self.nodes_by_airport[ap]
+            home_base_here = ap if ap in base_airports_set else ""
             for i in range(len(ap_nodes) - 1):
-                self._make_wait_arc(ap_nodes[i], ap_nodes[i+1])
+                self._make_wait_arc(ap_nodes[i], ap_nodes[i+1], home_base=home_base_here)
 
         if self.verbose:
             print(f"    Wait arcs built  ({_t.time()-t0:.1f}s)")
@@ -1045,10 +901,16 @@ class CrewDDDNetwork:
             print(f"    Flight+deadhead arcs: {n_arcs}  total: {len(self.arcs)}  "
                   f"({_t.time()-t0:.1f}s)")
 
-    def _make_wait_arc(self, frm: Node, to: Node) -> Arc:
+    def _make_wait_arc(self, frm: Node, to: Node, home_base: str = "") -> Arc:
         dt = to.time - frm.time
-        overnight = 1 if dt >= OVERNIGHT_THRESHOLD else 0
-        cost = dt * C_WT + overnight * C_OV
+        if home_base and frm.airport == home_base:
+            # Home wait is free: mandatory rest at base carries no per-diem or
+            # overnight penalty.  This removes cost pressure that would otherwise
+            # discourage the solver from routing crew home at all.
+            cost = 0.0
+        else:
+            overnight = 1 if dt >= OVERNIGHT_THRESHOLD else 0
+            cost = dt * C_WT + overnight * C_OV
         arc = self._make_arc(frm, to, to.time, cost, 'wait')
         self.wait_arc_by_start[frm] = arc
         # Rest resets duty (slide 29: wait ≥ Δ_rest resets duty clock)
@@ -1125,160 +987,87 @@ class CrewDDDNetwork:
             ap = arc.start.airport
             if ap == crew.base or ap == self.crew_start_airport.get(crew.id, crew.base):
                 return True
-        return arc in self._base_reachable_arcs.get(crew.base, set())
+        return arc in self._base_reachable_arcs.get(crew.id, set())
 
     def _compute_base_reachability(self):
         """
-        Compute reachable arc sets once per base (not per crew member).
-        All crew from the same base with the same clock state share the same
-        reachable subgraph. This reduces Dijkstra calls from |C| to |B|.
+        Compute reachable arc sets, one per distinct crew CLOCK-GROUP rather than
+        one per base.
 
-        R_b = arcs whose both endpoints are in Fwd_b ∩ Bwd_b  (slide 18).
-        Clock state from carry-over is used for Fwd pruning (d_work, d_away).
+        FIX (stranding): the previous version computed a single reachable set per
+        base using the WORST-CASE d_work across all crew at that base
+        (max_dwork = max over C_b).  That poisoned fresh, home-based crew with a
+        stranded member's carry-over clock: a base with even one crew at
+        d_work = D_WORK had its entire reachable arc set pruned as if every crew
+        were maxed out, so the fresh crew could not be deployed and silently
+        dropped out of every later window.
+
+        Now each crew member's reachability is computed from THEIR OWN start
+        airport and carry-over clock (init_dwork, init_t_last_home).  Crew sharing
+        an identical (base, start_airport, init_dwork, init_t_last_home) signature
+        share a single Dijkstra, so the call count stays close to |B| in the
+        common case (most crew start at home with a zero clock).
+
+        self._base_reachable_arcs is now keyed by CREW ID (not base).
         """
         import time as _t
         t0 = _t.time()
-        bases = sorted(set(c.base for c in self.crew))
-        self._base_reachable_arcs: dict[str, set[Arc]] = {}
+        self._base_reachable_arcs: dict[int, set[Arc]] = {}   # keyed by crew.id
 
         node_list   = list(self.nodes)
-        arcs_from_d = dict(self.arcs_from)   # snapshot
+        arcs_from_d = dict(self.arcs_from)
         arcs_to_d   = dict(self.arcs_to)
 
-        for base in bases:
-            horizon_node = Node(base, self.horizon_end)
+        group_cache: dict[tuple, set[Arc]] = {}
+        n_dijkstra = 0
+        for c in self.crew:
+            start_ap = self.crew_start_airport.get(c.id, c.base)
+            clock    = self.carry_clocks.get(c.id, ClockState())
+            init_dwork = clock.d_work
+            # Away clock only matters if the crew actually starts away from home.
+            if start_ap != c.base and clock.t_last_home_return >= 0:
+                init_tlh = clock.t_last_home_return
+            else:
+                init_tlh = -1
+            key = (c.base, start_ap, init_dwork, init_tlh)
 
-            # Depot sources: home base + any off-base start positions for this base's crew
-            depot_sources: list[Node] = []
-            home_depot = Node(base, self.depot_start)
-            if home_depot in self.nodes:
-                depot_sources.append(home_depot)
-            for c in self.crew:
-                if c.base != base:
-                    continue
-                sa = self.crew_start_airport.get(c.id, base)
-                if sa != base:
-                    n = Node(sa, self.depot_start)
-                    if n in self.nodes and n not in depot_sources:
-                        depot_sources.append(n)
-
-            if not depot_sources or horizon_node not in self.nodes:
-                self._base_reachable_arcs[base] = set()
+            cached = group_cache.get(key)
+            if cached is not None:
+                self._base_reachable_arcs[c.id] = cached
                 continue
 
-            # Worst-case carry-over clock for this base.
-            # max_dwork: use the highest d_work so reachability is pruned for
-            # the most constrained crew member (conservative / correct).
-            # min_t_last_home: use the earliest last-home-touch so the away
-            # clock is most consumed — again the conservative choice.
-            # Both default to values that impose no extra constraint when there
-            # is no carry-over (window 0 or no prior solution).
-            base_clocks = [self.carry_clocks.get(c.id, ClockState())
-                           for c in self.crew if c.base == base]
-            max_dwork = max((cs.d_work for cs in base_clocks), default=0)
-            # Only consider crews whose start airport for this window is NOT home
-            # (i.e. they are actually away); for crews starting at home the away
-            # clock is irrelevant and we don't want to penalise reachability.
-            away_last_homes = [
-                cs.t_last_home_return
-                for c in self.crew if c.base == base
-                for cs in [self.carry_clocks.get(c.id, ClockState())]
-                if self.crew_start_airport.get(c.id, base) != base
-                and cs.t_last_home_return >= 0
-            ]
-            # init_t_last_home: earliest (most constrained) last-home time among
-            # away crew, or -1 if all crew start at home this window.
-            init_t_last_home = min(away_last_homes) if away_last_homes else -1
+            depot_node   = Node(start_ap, self.depot_start)
+            horizon_node = Node(c.base, self.horizon_end)
+            if depot_node not in self.nodes or horizon_node not in self.nodes:
+                group_cache[key] = set()
+                self._base_reachable_arcs[c.id] = set()
+                continue
 
             reachable_nodes = compute_reachable(
                 nodes=node_list,
                 arcs_from=arcs_from_d,
                 arcs_to=arcs_to_d,
-                depot_nodes=depot_sources,
+                depot_nodes=[depot_node],
                 horizon_nodes=[horizon_node],
                 t_hor=self.horizon_end,
-                base_airport=base,
-                init_dwork=max_dwork,
-                init_t_last_home=init_t_last_home,
+                base_airport=c.base,
+                init_dwork=init_dwork,
+                init_t_last_home=init_tlh,
             )
-
-            # An arc is usable iff both its endpoints are reachable
+            n_dijkstra += 1
             reachable_arcs = {
                 arc for arc in self.arcs
                 if arc.start in reachable_nodes and arc.end in reachable_nodes
             }
-            self._base_reachable_arcs[base] = reachable_arcs
+            group_cache[key] = reachable_arcs
+            self._base_reachable_arcs[c.id] = reachable_arcs
 
-        n_bases = len(bases)
-        avg_arcs = (sum(len(v) for v in self._base_reachable_arcs.values()) / max(1, n_bases))
-        total_arcs = len(self.arcs)
-        first_call = not getattr(self, '_reachability_logged', False)
         if self.verbose:
-            print(f"    Reachability: {n_bases} bases, avg {avg_arcs:.0f}/{total_arcs} arcs "
-                  f"reachable per base  ({_t.time()-t0:.1f}s)")
-
-        # ── Connected component diagnostic (first call only) ──────────────────
-        # Two bases are in the same component if their reachable flight-arc sets
-        # overlap (i.e. there exists at least one flight arc reachable from both).
-        if first_call and self.verbose:
-            flight_arc_sets: dict[str, frozenset] = {
-                b: frozenset(
-                    a.id for a in arcs
-                    if a.arc_type in ('flight', 'deadhead')
-                )
-                for b, arcs in self._base_reachable_arcs.items()
-            }
-
-            # Union-Find
-            parent = {b: b for b in bases}
-
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            def union(x, y):
-                parent[find(x)] = find(y)
-
-            base_list = list(bases)
-            for i in range(len(base_list)):
-                for j in range(i + 1, len(base_list)):
-                    bi, bj = base_list[i], base_list[j]
-                    if flight_arc_sets[bi] & flight_arc_sets[bj]:
-                        union(bi, bj)
-
-            # Group bases by root
-            components: dict[str, list[str]] = defaultdict(list)
-            for b in bases:
-                components[find(b)].append(b)
-
-            # Separate out isolated bases (no flight arcs at all)
-            connected = {r: sorted(members)
-                         for r, members in components.items()
-                         if any(flight_arc_sets[b] for b in members)}
-            isolated  = sorted(
-                b for b in bases if not flight_arc_sets[b]
-            )
-
-            n_comp = len(connected)
-            print(f"    Connected components: {n_comp}  |  "
-                  f"isolated bases (no flight arcs): {len(isolated)}")
-            if n_comp > 1:
-                for idx, (_, members) in enumerate(
-                    sorted(connected.items(), key=lambda kv: -len(kv[1])), 1
-                ):
-                    n_crew = sum(self.base_crew.get(b, 0) for b in members)
-                    print(f"      Component {idx}: {len(members)} bases, "
-                          f"{n_crew} crew  [{', '.join(members[:8])}"
-                          f"{'…' if len(members) > 8 else ''}]")
-            if isolated:
-                n_iso_crew = sum(self.base_crew.get(b, 0) for b in isolated)
-                print(f"      Isolated: {isolated[:8]}"
-                      f"{'…' if len(isolated) > 8 else ''}  "
-                      f"({n_iso_crew} crew — tier-1 drop: no flight/dh arcs reachable)")
-
-            self._reachability_logged = True
+            n_groups = len(group_cache)
+            avg_arcs = sum(len(v) for v in group_cache.values()) / max(1, n_groups)
+            print(f"    Reachability: {len(self.crew)} crew in {n_groups} clock-groups, "
+                  f"{n_dijkstra} Dijkstra calls, avg {avg_arcs:.0f}/{len(self.arcs)} "
+                  f"arcs reachable per group  ({_t.time()-t0:.1f}s)")
 
     def add_node(self, airport: str, time: int):
         """DDD refinement: insert a new node, rewire wait arcs, expose new flight arcs."""
@@ -1331,10 +1120,12 @@ class CrewDDDNetwork:
         # Step 4: Create replacement wait arcs.
         # Reachability is fresh and flow constraints exist for new_node,
         # so _add_arc_var_for_crew can correctly wire variable coefficients.
+        _base_airports = set(c.base for c in self.crew)
+        _hb = airport if airport in _base_airports else ""
         if prev_node:
-            self._make_wait_arc(prev_node, new_node)
+            self._make_wait_arc(prev_node, new_node, home_base=_hb)
         if next_node:
-            self._make_wait_arc(new_node, next_node)
+            self._make_wait_arc(new_node, next_node, home_base=_hb)
 
         # Step 5: Expose new flight/deadhead arcs at new_node.
         self._expose_flight_arcs_from(new_node)
@@ -1389,45 +1180,28 @@ class CrewDDDNetwork:
         self.model = gp.Model("CrewPairing_DDD")
         self.model.setParam("OutputFlag", 0)
 
-        # ── Per-base reachability (prune variables before creation) ───────────
-        self._base_reachable_arcs = {}
-        self._compute_base_reachability()
-
-        # ── Stranded-crew recovery ─────────────────────────────────────────────
-        # A crew carried forward to an off-base airport (from the previous window's
-        # committed position) can become stranded if that airport has no outgoing
-        # flight, deadhead, OR wait arcs in THIS window's graph — making the flow
-        # balance constraint demand 1 unit departs a completely dead node.
-        #
-        # IMPORTANT: "no reachable flight/dh arcs" is NOT the right test.
-        # A crew at an off-base airport after hitting D_WORK consecutive duty days
-        # will have ALL flight/dh arcs pruned by the clock-constrained Dijkstra
-        # (init_dwork >= D_WORK -> new_dw > D_WORK on first flight -> prune).
-        # That is correct model behaviour: they need a rest wait before flying again.
-        # Resetting them to home base in this case is a TELEPORT, not a recovery.
-        #
-        # Correct detection: the crew is truly stranded only if Node(start_ap, depot_start)
-        # has NO arcs at all in self.arcs_from (not even a wait arc).  A wait arc is
-        # always usable (bypasses reachability in _crew_can_use_arc) and will let the
-        # crew rest until a flight/dh arc becomes feasible.
-        #
-        # If Node(start_ap, depot_start) doesn't even exist in the graph (the airport
-        # had no activity at all this window), we also reset — that is a genuine dead-end.
+        # ── Stranded-crew recovery (runs BEFORE reachability) ──────────────────
+        # A crew carried to an off-base airport is truly stranded only if
+        # Node(start_ap, depot_start) has NO arcs at all in self.arcs_from (not
+        # even a wait arc).  Those crew are reset to their home base.  This must
+        # happen BEFORE _compute_base_reachability so the per-crew reachable set
+        # is computed from the corrected start airport.
         n_stranded_reset = 0
         for c in self.crew:
             start_ap = self.crew_start_airport.get(c.id, c.base)
             if start_ap == c.base:
-                continue  # already home, nothing to check
+                continue
             depot_node = Node(start_ap, self.depot_start)
-            # Any arc from depot_node (including wait) is enough to avoid infeasibility.
-            # Wait arcs bypass the reachability check and allow the crew to rest in place.
-            has_any_arc = bool(self.arcs_from.get(depot_node))
-            if not has_any_arc:
+            if not bool(self.arcs_from.get(depot_node)):
                 self.crew_start_airport[c.id] = c.base
                 n_stranded_reset += 1
         if self.verbose and n_stranded_reset:
             print(f"    Stranded-crew reset: {n_stranded_reset} crew returned to home base "
                   f"(carry-over airport has no arcs at all in this window's graph)")
+
+        # ── Per-crew reachability (prune variables before creation) ───────────
+        self._base_reachable_arcs = {}
+        self._compute_base_reachability()
 
         # ── Active crew: drop crew whose base is structurally isolated ──────────
         # Two-tier check:
@@ -1449,7 +1223,7 @@ class CrewDDDNetwork:
         dropped_isolated = 0   # tier 1: no flight/dh arcs at all
         dropped_no_cov   = 0   # tier 2: has arcs but can't reach any cov flight
         for c in self.crew:
-            reachable = self._base_reachable_arcs.get(c.base, set())
+            reachable = self._base_reachable_arcs.get(c.id, set())
             flight_dh_arcs = [a for a in reachable
                               if a.arc_type in ('flight', 'deadhead')]
             if not flight_dh_arcs:
@@ -1479,7 +1253,7 @@ class CrewDDDNetwork:
         # ── Variables: x_{c,a} ∈ [0,1] (slide 25) ───────────────────────────
         # Arc cost is adjusted per crew: a deadhead arc whose destination is the
         # crew's home base is discounted by C_DH_HOME_RETURN_DISCOUNT so the solver
-        # prefers routing satellite / regional crew home over sending them onward.
+        # prefers routing regional / spoke crew home over sending them onward.
         # The discount is encoded in each variable's obj coefficient so it flows
         # through to the Gurobi objective without changing the shared arc.cost.
         total_vars = 0
@@ -1649,11 +1423,22 @@ class CrewDDDNetwork:
             inb_list   = crew_inb_idx[c.id]
             if not dep_list or not inb_list:
                 continue
+            # Lower bound on when any away spell for this crew could have started.
+            # An inbound arc can only END a trip that reached the D_AWAY cap if it
+            # arrives >= DELTA_AWAY after this bound; otherwise the trip was short
+            # and owes no 48h break, so we skip the coupling entirely.
+            _start_ap = self.crew_start_airport.get(c.id, c.base)
+            _pc = self.carry_clocks.get(c.id, ClockState())
+            if _start_ap != c.base:
+                trip_start_lb = _pc.away_since if _pc.away_since > -LARGE else self.win.t_start
+            else:
+                trip_start_lb = self.depot_start
             for t_dep, dep_arc in dep_list:
                 t_lo   = t_dep - DELTA_HB
                 lo_idx = _bisect.bisect_left(inb_list, (t_lo,))
                 hi_idx = _bisect.bisect_left(inb_list, (t_dep,))
-                recent_inbound = [arc for _, arc in inb_list[lo_idx:hi_idx]]
+                recent_inbound = [arc for te, arc in inb_list[lo_idx:hi_idx]
+                                  if te - trip_start_lb >= DELTA_AWAY]
                 if not recent_inbound:
                     continue
                 self.model.addConstr(
@@ -1695,16 +1480,21 @@ class CrewDDDNetwork:
             clock = self.carry_clocks.get(c.id)
             if clock is None:
                 continue
-            t_ret = clock.t_last_home_return
-            if t_ret < 0:
-                # Never returned home before this window; no embargo needed
+            # Embargo ONLY crew who finished a trip that hit the D_AWAY cap and so
+            # owe a 48h home break.  Short round-trips set home_break_until = -LARGE
+            # and are never embargoed (this is what was killing window-1 coverage).
+            embargo_end = clock.home_break_until
+            if embargo_end <= -LARGE:
                 continue
-            embargo_end = t_ret + DELTA_HB
             if embargo_end <= self.win.t_start:
                 # Break already completed before this window started; nothing to block
                 continue
-            # Some or all of the 48-hour break must be served during this window.
-            # Block every departure arc from home base with dep_time < embargo_end.
+            # Crew has an outstanding home-break obligation that runs into this window.
+            # Even if they start the window at their home base (e.g. arrived home 7h
+            # before the window boundary), the embargo still applies — they haven't
+            # served the full 48h yet.  The home-spine wait arc keeps them in place
+            # until embargo_end, but we still need to zero-out departure arcs before
+            # that time so the LP/MIP can't schedule a departure before the break ends.
             cvars = self.arc_var[c.id]
             blocked = [
                 arc for arc in cvars
@@ -1726,10 +1516,9 @@ class CrewDDDNetwork:
             clock = self.carry_clocks.get(c.id)
             if clock is None:
                 continue
-            t_ret = clock.t_last_home_return
-            if t_ret < 0:
+            embargo_end = clock.home_break_until
+            if embargo_end <= -LARGE:
                 continue
-            embargo_end = t_ret + DELTA_HB
             if embargo_end > self.win.t_start:
                 self._xw_hb_embargo[c.id] = embargo_end
 
@@ -1738,6 +1527,13 @@ class CrewDDDNetwork:
             print(f"    Cross-window home-break constraints: {n_xw_hb}  "
                   f"({len(self._xw_hb_embargo)} crew under embargo)  "
                   f"({_t.time()-t0:.1f}s)")
+
+        # NOTE: d_away (4-day return window) is enforced structurally by the
+        # clock-constrained Dijkstra in compute_reachable / _compute_base_reachability.
+        # Arcs that cannot be part of any d_away-feasible path are excluded from
+        # _base_reachable_arcs and therefore never get variables.  No additional LP
+        # constraint rows are needed: the Dijkstra already prunes the arc set to only
+        # paths that include a home-return within DELTA_AWAY.
 
     def _add_arc_var_for_crew(self, crew_id: int, arc: Arc):
         if arc in self.arc_var.get(crew_id, {}):
@@ -1761,6 +1557,7 @@ class CrewDDDNetwork:
             and arc.start.airport == c.base
             and arc.start.time < embargo_end
         )
+
         ub = 0.0 if is_embargoed else 1.0
 
         # Home-return deadhead discount (same logic as in build_model variable creation)
@@ -2181,6 +1978,8 @@ class CrewDDDNetwork:
             last_d_work = 0
             last_h_home = 0
             last_home_return = -LARGE  # absolute time of last arrival at home base
+            carried_away_since = -LARGE
+            home_break_until = -LARGE
 
             if not no_solution:
                 try:
@@ -2205,10 +2004,38 @@ class CrewDDDNetwork:
                     last_flight_true_end: int = -1   # true_end of most recent flight arc
                     duty_days_set: set[int] = set()  # calendar days with any flight
                     last_d_work = 0  # reset below after full walk
+
+                    # Away-spell tracking for the conditional 48h home break.  A trip
+                    # owes a 48h break ONLY if it reached the D_AWAY (4-day) cap; short
+                    # round-trips take the normal 8h rest and stay free to fly.  If the
+                    # crew began this window already away, inherit when their current
+                    # trip started so its full length is measured.
+                    start_ap = self.crew_start_airport.get(c.id, c.base)
+                    prev_clock = self.carry_clocks.get(c.id, ClockState())
+                    if start_ap != c.base:
+                        away_since = (prev_clock.away_since
+                                      if prev_clock.away_since > -LARGE
+                                      else self.win.t_start)
+                    else:
+                        away_since = -LARGE
+                    last_long_trip_return = -LARGE   # return of most recent trip that
+                                                     # reached the D_AWAY cap
+
                     for arc in active_arcs:
                         if arc.end.time > t_commit:
                             break
                         last_airport = arc.end.airport
+                        # Departing home starts an away spell; arriving home ends it.
+                        if (arc.arc_type in ('flight', 'deadhead')
+                                and arc.start.airport == c.base
+                                and arc.end.airport != c.base
+                                and away_since <= -LARGE):
+                            away_since = arc.start.time
+                        if arc.end.airport == c.base and away_since > -LARGE:
+                            if arc.true_end - away_since >= DELTA_AWAY:
+                                last_long_trip_return = max(last_long_trip_return,
+                                                            arc.true_end)
+                            away_since = -LARGE
                         if arc.arc_type == 'flight':
                             # Count duty day by which calendar day the flight DEPARTS.
                             # Two flights on the same calendar day = 1 duty day.
@@ -2251,6 +2078,15 @@ class CrewDDDNetwork:
                         if arc.end.airport == c.base:
                             last_home_return = max(last_home_return, arc.true_end)
 
+                    # Conditional home break: owed ONLY when the last completed away
+                    # trip reached the D_AWAY cap (short trips owe nothing).
+                    if last_long_trip_return > -LARGE:
+                        home_break_until = last_long_trip_return + DELTA_HB
+                    else:
+                        home_break_until = -LARGE
+                    # Carry the ongoing away-spell start if still away at t_commit.
+                    carried_away_since = away_since if last_airport != c.base else -LARGE
+
                     # NOTE: we do NOT look into the tail (t > t_commit) to find a
                     # planned home return and pre-emptively mark the crew as home.
                     # That was the old "key fix" and it caused teleportation: the
@@ -2269,6 +2105,8 @@ class CrewDDDNetwork:
                 d_work=last_d_work,
                 h_home=last_h_home,
                 t_last_home_return=last_home_return,
+                away_since=carried_away_since,
+                home_break_until=home_break_until,
             )
 
         # n_{b,k}^{w+1} (slide 22)
@@ -2644,12 +2482,30 @@ if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else "data/flights_enriched.csv"
     days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
 
-    # Auto-detect the airline with the fewest flights in the CSV (fastest to solve)
+    # Tally flights per operating carrier.
     with open(path, encoding="utf-8") as _f:
         _counts = _Counter(row["OP_CARRIER"].strip()
                            for row in _csv.DictReader(_f)
                            if row.get("OP_CARRIER", "").strip())
-    airline = _counts.most_common()[-1][0]
-    print(f"Airline of interests: {airline} ({_counts[airline]:,} rows)")
 
+    ranked = _counts.most_common()              # [(code, n), ...] high -> low
+    print(f"\n{len(ranked)} airlines found in {path}:\n")
+    for i, (code, n) in enumerate(ranked, 1):
+        print(f"  [{i:2d}]  {code:4s}  {n:>9,} flights")
+
+    # Airline may be given as the 3rd CLI arg (code or list number); else prompt.
+    choice = sys.argv[3].strip() if len(sys.argv) > 3 else None
+    if not choice:
+        choice = input("\nChoose an airline (enter its code or list number): ").strip()
+
+    num_to_code = {str(i): code for i, (code, _) in enumerate(ranked, 1)}
+    valid_codes = {code for code, _ in ranked}
+    if choice in num_to_code:
+        airline = num_to_code[choice]
+    elif choice.upper() in valid_codes:
+        airline = choice.upper()
+    else:
+        raise SystemExit(f"'{choice}' is not a valid airline code or list number.")
+
+    print(f"\nSelected airline: {airline} ({_counts[airline]:,} flights)")
     main(path, days=days, out_dir="results", verbose=True, airlines_filter=[airline])
