@@ -76,10 +76,23 @@ from gurobipy import GRB
 # PARAMETERS  (aligned with slides 9–11)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Away-from-base limit — defined here (ahead of the duty/rest block) because the
+# rolling-horizon tail is derived from it. A crew may be away from its home base for
+# at most D_AWAY days before it must return ("return window").
+D_AWAY      = 4              # max days away from home base
+DELTA_AWAY  = D_AWAY * 1440  # in minutes
+
 # Rolling horizon (slide 20)
 T_DAYS_SOLVE   = 7    # solve window length in days
 T_DAYS_COMMIT  = 3    # days committed per step
-T_DAYS_TAIL    = 7    # return tail days
+# Return tail: the horizon must reach far enough past the solve window that a crew
+# departing at the END of the solve window can still be routed home within its
+# away-limit. That required distance is exactly D_AWAY (a later departure has no
+# claim on this window — the next window owns it). So tail = D_AWAY, plus a 1-day
+# buffer for time-bucket snapping and backward-reachability slack.
+#   horizon = (T_SOLVE + T_TAIL) days = 7 + 5 = 12  (was a hand-set 7 -> 14)
+TAIL_BUFFER_DAYS = 1
+T_DAYS_TAIL    = D_AWAY + TAIL_BUFFER_DAYS   # = 5
 T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 
 # Crew limits (slide 9)
@@ -87,6 +100,17 @@ S_MIN = 3             # minimum crew at any base 3
 S_MAX = 120           # maximum crew at any single base (raised to allow ORD to be
                       # correctly staffed: ORD carries ~49% of all flights)
 RANDOM_SEED = 42
+
+# ── Optional: randomized minimum cabin crew ──────────────────────────────────
+# When RANDOM_MIN_CREW is True, the CSV's MIN_CABIN_CREW (the FAA 14 CFR 121.391
+# value derived from seat count) is IGNORED and the minimum crew per flight is drawn
+# at random instead. The draw is CONSTANT for a given flight number (per airline)
+# across all of its occurrences — i.e. the same scheduled flight on different days
+# always carries the same crew requirement — and is fully reproducible via
+# RANDOM_SEED. Inclusive bounds.
+RANDOM_MIN_CREW      = False   # toggle: draw min crew randomly instead of from CSV
+RANDOM_MIN_CREW_MIN  = 1       # inclusive lower bound for the draw
+RANDOM_MIN_CREW_MAX  = 3       # inclusive upper bound for the draw
 
 # Crew base assignment (slide 12)
 MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
@@ -112,8 +136,8 @@ DELTA_REST  = 8 * 60  # min rest before next duty (min) = 480
 DELTA_DUTY  = 14 * 60 # max on-duty time per day (min) = 840
 DELTA_HB    = 48 * 60 # min home break (min) = 2880
 D_WORK      = 3       # max consecutive duty days
-D_AWAY      = 4       # return window in days
-DELTA_AWAY  = D_AWAY * 1440  # in minutes
+# D_AWAY / DELTA_AWAY are defined above the rolling-horizon block (the return tail
+# is derived from D_AWAY).
 
 
 C_UNC_EFFECTIVE = 10**8
@@ -222,18 +246,46 @@ def parse_hhmm(s: str) -> int:
     return int(s[:2]) * 60 + int(s[2:])
 
 
+# Cache so every occurrence of the same (airline, flight number) gets the SAME draw.
+_RANDOM_MIN_CREW_CACHE: dict[tuple[str, str], int] = {}
+
+def random_min_crew(airline: str, flight_num: str) -> int:
+    """Random minimum cabin crew for a flight, held CONSTANT across every occurrence
+    of the same (airline, flight number) — the same scheduled flight on different days
+    always returns the same value. Deterministic / reproducible via RANDOM_SEED: the
+    draw is keyed on (seed, airline, flight number), so it does not depend on CSV row
+    order or on how many times the flight appears. Bounds come from
+    RANDOM_MIN_CREW_MIN / RANDOM_MIN_CREW_MAX (inclusive)."""
+    key = (airline, flight_num)
+    val = _RANDOM_MIN_CREW_CACHE.get(key)
+    if val is None:
+        rng = random.Random(f"{RANDOM_SEED}|{airline}|{flight_num}")
+        val = rng.randint(RANDOM_MIN_CREW_MIN, RANDOM_MIN_CREW_MAX)
+        _RANDOM_MIN_CREW_CACHE[key] = val
+    return val
+
+
 def parse_flights_by_airline(
     filepath: str,
     days: int,
     horizon_days: Optional[int] = None,
+    random_min_crew_override: Optional[bool] = None,
 ) -> tuple[dict[str, list[Flight]], datetime]:
     """
     Load flights grouped by operating carrier (OP_CARRIER).
+
+    min_crew source:
+        - default (random_min_crew_override is None): use the module flag
+          RANDOM_MIN_CREW. When False, read MIN_CABIN_CREW from the CSV (FAA
+          121.391). When True, draw a random value that is constant per
+          (airline, flight number) via random_min_crew().
+        - pass random_min_crew_override=True/False to force it for this call.
 
     Returns:
         flights_by_airline : {airline_code: [Flight, ...]}
         week_start         : datetime of the first flight date
     """
+    use_random = RANDOM_MIN_CREW if random_min_crew_override is None else random_min_crew_override
     if horizon_days is None:
         horizon_days = days
 
@@ -273,7 +325,9 @@ def parse_flights_by_airline(
                 dep_hhmm = row['CRS_DEP_TIME'].strip()
                 arr_hhmm = row['CRS_ARR_TIME'].strip()
                 elapsed  = float(row['CRS_ELAPSED_TIME'].strip())
-                min_crew = int(float(row['MIN_CABIN_CREW'].strip()))
+                # min_crew from CSV only when not randomizing; otherwise drawn below
+                # so the MIN_CABIN_CREW column is not required for randomized runs.
+                min_crew = 1 if use_random else int(float(row['MIN_CABIN_CREW'].strip()))
             except (ValueError, KeyError):
                 continue
 
@@ -299,6 +353,11 @@ def parse_flights_by_airline(
                 load_factor = 0.82
 
             airline = row.get('OP_CARRIER', '').strip()
+            flight_num = row.get('OP_CARRIER_FL_NUM', str(fid)).strip()
+
+            # Randomized min crew: constant per (airline, flight number) across days.
+            if use_random:
+                min_crew = random_min_crew(airline, flight_num)
 
             flight = Flight(
                 id=fid,
@@ -308,7 +367,7 @@ def parse_flights_by_airline(
                 arr_min=arr_min,
                 duration=arr_min - dep_min,
                 min_crew=max(1, min_crew),
-                flight_num=row.get('OP_CARRIER_FL_NUM', str(fid)).strip(),
+                flight_num=flight_num,
                 distance=float(row['DISTANCE'].strip()) if row.get('DISTANCE', '').strip() else 0.0,
                 load_factor=load_factor,
                 airline=airline,
@@ -363,6 +422,7 @@ def assign_crew_bases(
         demand_minutes[f.origin] += f.min_crew * f.duration
 
     # Peak concurrent crew demand per airport (dep = +crew, arr = -crew sweep).
+    # NOTE: deltas are weighted by m_f, so peak already reflects multi-crew flights.
     events_by_ap: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for f in flights:
         events_by_ap[f.origin].append((f.dep_min, +f.min_crew))
@@ -375,6 +435,16 @@ def assign_crew_bases(
             pk = max(pk, cur)
         peak_concurrent[ap] = pk
 
+    # Co-location floor: the m_f crew on a single flight must ALL be at the same
+    # airport at the same instant and depart together.  A base therefore must be
+    # able to field at least max(m_f) crew simultaneously to launch its largest
+    # originating flight.  This is the constraint multi-crew adds that pure volume
+    # scaling misses: with the seat -> FA rule, a station serving a 200-seat jet
+    # needs >=4 co-located crew, while a 50-seat regional spoke needs only 1.
+    coloc_floor: dict[str, int] = defaultdict(int)
+    for f in flights:
+        coloc_floor[f.origin] = max(coloc_floor[f.origin], f.min_crew)
+
     horizon_days = max(f.arr_min for f in flights) / 1440 if flights else 3
     tau_duty = 8 * 60 * max(1.0, horizon_days) * CREW_UTILISATION
 
@@ -384,9 +454,20 @@ def assign_crew_bases(
         peak     = peak_concurrent.get(ap, 0)
         n_demand = math.ceil((demand / tau_duty) * 1.5) if demand > 0 else 0
         n_peak   = math.ceil(peak * 1.5)
-        needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
+        # Rotation-aware floor.  A self-sustaining base needs ~MIN_CREW_PER_BASE
+        # rotation "slots" (one crewing a flight, others resting / returning home),
+        # and EACH slot must be filled by max(m_f) crew because that many fly
+        # together on the largest flight.  So the floor scales with crew-per-flight:
+        #   min_crew=1 -> 3   (identical to the original flat floor)
+        #   min_crew=2 -> 6,  min_crew=4 -> 12, ...
+        # This is what makes the count respond at LOW-VOLUME spokes, where n_demand
+        # and n_peak both fall at/under the old flat 3 and a doubling of m_f was
+        # otherwise invisible.  (n_peak already captures the instantaneous
+        # co-location spike; this captures the sustained throughput it misses.)
+        floor    = MIN_CREW_PER_BASE * coloc_floor.get(ap, 1)
+        needed   = max(n_demand, n_peak, floor)
         noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
-        base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
+        base_counts[ap] = max(floor, min(S_MAX, noisy))
 
     # ── Build CrewMember list ─────────────────────────────────────────────────
     crew_list: list[CrewMember] = []
@@ -757,6 +838,50 @@ class CrewDDDNetwork:
         self.flow_constrs: dict[int, dict[Node, gp.Constr]] = {}
         self.coverage_constrs: dict[int, gp.Constr] = {}
         self._base_reachable_arcs: dict[str, set[Arc]] = {}  # populated in build_model
+        # Warm start: routes from the previous (overlapping) window, used as a
+        # Gurobi MIP start.  Consecutive windows commit 3 days but solve 7, so they
+        # share most flights and the prior solution is a strong incumbent.
+        self._warm_start_routes: list[dict] = []
+
+    def set_warm_start(self, routes: list[dict]):
+        """Provide the previous window's routes to seed this window's MIP start."""
+        self._warm_start_routes = routes or []
+
+    def _apply_warm_start(self):
+        """Seed Var.Start from the previous window's flight/deadhead assignments.
+
+        Matched by (crew_id, arc_type, flight_id) — flight_id is the stable global
+        Flight.id, so a crew that flew flight X last window is pointed at the same
+        flight arc here if X is still in this window's horizon.  This is a PARTIAL
+        start (only flight/deadhead arcs); Gurobi completes the wait arcs.  Any
+        assignment that doesn't fit this window (crew now starts elsewhere) is
+        simply ignored by Gurobi, so a stale start can never make the model wrong.
+        """
+        if not self._warm_start_routes:
+            return
+        n_set = 0
+        for r in self._warm_start_routes:
+            cid = r.get("crew_id")
+            cvars = self.arc_var.get(cid)
+            if not cvars:
+                continue
+            lut = {}
+            for arc, var in cvars.items():
+                if arc.flight_id is not None:
+                    lut[(arc.arc_type, arc.flight_id)] = var
+            for leg in r.get("legs", []):
+                fid = leg.get("flight_id")
+                if fid is None:
+                    continue
+                var = lut.get((leg.get("type"), fid))
+                if var is not None:
+                    var.Start = 1.0
+                    n_set += 1
+        if n_set:
+            self.model.update()
+            if self.verbose:
+                print(f"  Warm start: seeded {n_set} flight/deadhead "
+                      f"assignments from the previous window")
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1765,7 +1890,7 @@ class CrewDDDNetwork:
         2. Detect violations
         3. Refine: insert nodes, bisect wait arcs, expose new arcs
         4. Repeat until no violations
-        5. Switch to MIP (binary), solve with MIPGap=0.01, TimeLimit=300s
+        5. Switch to MIP (binary), solve with MIPGap=0.01, TimeLimit=600s
         """
         print(f"\n  === DDD Solve (window {self.win.idx}) ===")
         solved = False
@@ -1838,7 +1963,20 @@ class CrewDDDNetwork:
             GRB.MINIMIZE,
         )
         self.model.setParam("MIPGap", 0.01)
-        self.model.setParam("TimeLimit", 300)
+        self.model.setParam("TimeLimit", 600)
+        # Speed hints for the (highly symmetric) per-crew MIP.  Crew at the same
+        # base — and the m_f interchangeable FAs on each flight — create large
+        # orbits that stall branch-and-bound; these help without touching the
+        # formulation (per-crew variables are retained, so routes are recoverable).
+        #   Symmetry=2 : aggressive symmetry detection/handling
+        #   MIPFocus=1 : prioritise finding good feasible incumbents (we care about
+        #                coverage, not a proof of optimality, and we hit the limit)
+        #   Threads=0  : use all available cores (explicit, in case it was limited)
+        self.model.setParam("Symmetry", 2)
+        self.model.setParam("MIPFocus", 1)
+        self.model.setParam("Threads", 0)
+        # Seed the previous window's solution as a MIP start (no-op for window 0).
+        self._apply_warm_start()
         self.model.optimize()
 
         return self.extract_solution()
@@ -2372,6 +2510,7 @@ def solve_airline(
     carry_positions: dict[str, dict[str, int]] = {}
     carry_clocks: dict[int, ClockState] = {}
     carry_crew_pos: dict[int, str] = {}   # Fix 2: per-crew-id airport from previous window
+    prev_routes: list[dict] = []          # previous window's routes -> MIP warm start
     all_results = []
     window_entries: list[dict] = []   # accumulate for combined save
 
@@ -2399,7 +2538,9 @@ def solve_airline(
         )
         net.build_initial_network()
         net.build_model()
+        net.set_warm_start(prev_routes)     # seed from previous window (no-op on window 0)
         result = net.solve()
+        prev_routes = result.get("routes", []) or []
 
         # Carry-over for next window (slides 22–23)
         # Fix 2: unpack the third return value (per-crew-id airport map)
@@ -2451,6 +2592,7 @@ def main(
     out_dir: str = ".",
     verbose: bool = True,
     airlines_filter: Optional[list[str]] = None,
+    random_min_crew: Optional[bool] = None,
 ):
     """
     Load flights → split by airline → solve each independently
@@ -2462,17 +2604,29 @@ def main(
         out_dir        : directory for JSON result files
         verbose        : print detailed DDD iteration info
         airlines_filter: if given, only solve these carriers (e.g. ['AA', 'DL'])
+        random_min_crew: None -> use module flag RANDOM_MIN_CREW; True/False to force
+                         drawing min cabin crew randomly (constant per flight number)
+                         vs. reading MIN_CABIN_CREW from the CSV.
     """
     import time as _t
     os.makedirs(out_dir, exist_ok=True)
     t_global = _t.time()
     horizon_days = days + T_DAYS_TAIL
 
+    use_random = RANDOM_MIN_CREW if random_min_crew is None else random_min_crew
+    if use_random:
+        crew_src = (f"RANDOM per flight number "
+                    f"(range {RANDOM_MIN_CREW_MIN}-{RANDOM_MIN_CREW_MAX}, "
+                    f"seed {RANDOM_SEED})")
+    else:
+        crew_src = "from CSV MIN_CABIN_CREW"
     print(f"Loading flights from {csv_path}...")
     print(f"  Planning period: {days} days  |  Horizon: {horizon_days} days")
+    print(f"  Min cabin crew : {crew_src}")
 
     flights_by_airline, week_start = parse_flights_by_airline(
-        csv_path, days=days, horizon_days=horizon_days
+        csv_path, days=days, horizon_days=horizon_days,
+        random_min_crew_override=use_random,
     )
 
     if airlines_filter:
@@ -2519,11 +2673,42 @@ def main(
 
 
 if __name__ == "__main__":
-    import sys, csv as _csv
+    import sys, csv as _csv, argparse
     from collections import Counter as _Counter
 
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/flights_enriched.csv"
-    days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    ap = argparse.ArgumentParser(
+        description="Rolling-horizon DDD crew scheduler.")
+    ap.add_argument("path", nargs="?", default="data/flights_enriched.csv",
+                    help="path to flights_enriched.csv (default: %(default)s)")
+    ap.add_argument("days", nargs="?", type=int, default=30,
+                    help="planning/coverage period in days (default: %(default)s)")
+    ap.add_argument("airline", nargs="?", default=None,
+                    help="airline code (e.g. AA) or list number; prompts if omitted")
+    # ── randomized minimum cabin crew ──
+    ap.add_argument("--random-min-crew", action="store_true",
+                    help="draw min cabin crew randomly instead of reading "
+                         "MIN_CABIN_CREW from the CSV; the draw is constant per "
+                         "flight number across all of its occurrences")
+    ap.add_argument("--random-min-crew-min", type=int, default=RANDOM_MIN_CREW_MIN,
+                    metavar="N", help="inclusive lower bound for the draw "
+                                      "(default: %(default)s)")
+    ap.add_argument("--random-min-crew-max", type=int, default=RANDOM_MIN_CREW_MAX,
+                    metavar="N", help="inclusive upper bound for the draw "
+                                      "(default: %(default)s)")
+    ap.add_argument("--seed", type=int, default=RANDOM_SEED, metavar="N",
+                    help="random seed for the min-crew draw (default: %(default)s)")
+    args = ap.parse_args()
+
+    if args.random_min_crew_min > args.random_min_crew_max:
+        ap.error("--random-min-crew-min must be <= --random-min-crew-max")
+
+    # Push CLI options into the module config that random_min_crew() reads.
+    RANDOM_MIN_CREW_MIN = args.random_min_crew_min
+    RANDOM_MIN_CREW_MAX = args.random_min_crew_max
+    RANDOM_SEED         = args.seed
+
+    path = args.path
+    days = args.days
 
     # Tally flights per operating carrier.
     with open(path, encoding="utf-8") as _f:
@@ -2536,8 +2721,8 @@ if __name__ == "__main__":
     for i, (code, n) in enumerate(ranked, 1):
         print(f"  [{i:2d}]  {code:4s}  {n:>9,} flights")
 
-    # Airline may be given as the 3rd CLI arg (code or list number); else prompt.
-    choice = sys.argv[3].strip() if len(sys.argv) > 3 else None
+    # Airline may be given as a positional (code or list number); else prompt.
+    choice = args.airline.strip() if args.airline else None
     if not choice:
         choice = input("\nChoose an airline (enter its code or list number): ").strip()
 
@@ -2551,4 +2736,5 @@ if __name__ == "__main__":
         raise SystemExit(f"'{choice}' is not a valid airline code or list number.")
 
     print(f"\nSelected airline: {airline} ({_counts[airline]:,} flights)")
-    main(path, days=days, out_dir="results", verbose=True, airlines_filter=[airline])
+    main(path, days=days, out_dir="results", verbose=True,
+         airlines_filter=[airline], random_min_crew=args.random_min_crew)
