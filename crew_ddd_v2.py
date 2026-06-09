@@ -101,17 +101,6 @@ S_MAX = 120           # maximum crew at any single base (raised to allow ORD to 
                       # correctly staffed: ORD carries ~49% of all flights)
 RANDOM_SEED = 42
 
-# ── Optional: randomized minimum cabin crew ──────────────────────────────────
-# When RANDOM_MIN_CREW is True, the CSV's MIN_CABIN_CREW (the FAA 14 CFR 121.391
-# value derived from seat count) is IGNORED and the minimum crew per flight is drawn
-# at random instead. The draw is CONSTANT for a given flight number (per airline)
-# across all of its occurrences — i.e. the same scheduled flight on different days
-# always carries the same crew requirement — and is fully reproducible via
-# RANDOM_SEED. Inclusive bounds.
-RANDOM_MIN_CREW      = False   # toggle: draw min crew randomly instead of from CSV
-RANDOM_MIN_CREW_MIN  = 1       # inclusive lower bound for the draw
-RANDOM_MIN_CREW_MAX  = 3       # inclusive upper bound for the draw
-
 # Crew base assignment (slide 12)
 MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
 
@@ -246,46 +235,23 @@ def parse_hhmm(s: str) -> int:
     return int(s[:2]) * 60 + int(s[2:])
 
 
-# Cache so every occurrence of the same (airline, flight number) gets the SAME draw.
-_RANDOM_MIN_CREW_CACHE: dict[tuple[str, str], int] = {}
-
-def random_min_crew(airline: str, flight_num: str) -> int:
-    """Random minimum cabin crew for a flight, held CONSTANT across every occurrence
-    of the same (airline, flight number) — the same scheduled flight on different days
-    always returns the same value. Deterministic / reproducible via RANDOM_SEED: the
-    draw is keyed on (seed, airline, flight number), so it does not depend on CSV row
-    order or on how many times the flight appears. Bounds come from
-    RANDOM_MIN_CREW_MIN / RANDOM_MIN_CREW_MAX (inclusive)."""
-    key = (airline, flight_num)
-    val = _RANDOM_MIN_CREW_CACHE.get(key)
-    if val is None:
-        rng = random.Random(f"{RANDOM_SEED}|{airline}|{flight_num}")
-        val = rng.randint(RANDOM_MIN_CREW_MIN, RANDOM_MIN_CREW_MAX)
-        _RANDOM_MIN_CREW_CACHE[key] = val
-    return val
-
-
 def parse_flights_by_airline(
     filepath: str,
     days: int,
     horizon_days: Optional[int] = None,
-    random_min_crew_override: Optional[bool] = None,
 ) -> tuple[dict[str, list[Flight]], datetime]:
     """
     Load flights grouped by operating carrier (OP_CARRIER).
 
-    min_crew source:
-        - default (random_min_crew_override is None): use the module flag
-          RANDOM_MIN_CREW. When False, read MIN_CABIN_CREW from the CSV (FAA
-          121.391). When True, draw a random value that is constant per
-          (airline, flight number) via random_min_crew().
-        - pass random_min_crew_override=True/False to force it for this call.
+    min_crew is read from the CSV's MIN_CABIN_CREW column (the FAA 14 CFR 121.391
+    value derived from seat count). To experiment with different crew requirements,
+    regenerate the CSV with faa_tail_lookup.py (which can also assign randomized
+    minimums) — the solver always trusts the column as given.
 
     Returns:
         flights_by_airline : {airline_code: [Flight, ...]}
         week_start         : datetime of the first flight date
     """
-    use_random = RANDOM_MIN_CREW if random_min_crew_override is None else random_min_crew_override
     if horizon_days is None:
         horizon_days = days
 
@@ -325,9 +291,7 @@ def parse_flights_by_airline(
                 dep_hhmm = row['CRS_DEP_TIME'].strip()
                 arr_hhmm = row['CRS_ARR_TIME'].strip()
                 elapsed  = float(row['CRS_ELAPSED_TIME'].strip())
-                # min_crew from CSV only when not randomizing; otherwise drawn below
-                # so the MIN_CABIN_CREW column is not required for randomized runs.
-                min_crew = 1 if use_random else int(float(row['MIN_CABIN_CREW'].strip()))
+                min_crew = int(float(row['MIN_CABIN_CREW'].strip()))
             except (ValueError, KeyError):
                 continue
 
@@ -354,10 +318,6 @@ def parse_flights_by_airline(
 
             airline = row.get('OP_CARRIER', '').strip()
             flight_num = row.get('OP_CARRIER_FL_NUM', str(fid)).strip()
-
-            # Randomized min crew: constant per (airline, flight number) across days.
-            if use_random:
-                min_crew = random_min_crew(airline, flight_num)
 
             flight = Flight(
                 id=fid,
@@ -848,40 +808,125 @@ class CrewDDDNetwork:
         self._warm_start_routes = routes or []
 
     def _apply_warm_start(self):
-        """Seed Var.Start from the previous window's flight/deadhead assignments.
+        """Seed the previous (overlapping) window's routes as Gurobi VARIABLE HINTS.
 
-        Matched by (crew_id, arc_type, flight_id) — flight_id is the stable global
-        Flight.id, so a crew that flew flight X last window is pointed at the same
-        flight arc here if X is still in this window's horizon.  This is a PARTIAL
-        start (only flight/deadhead arcs); Gurobi completes the wait arcs.  Any
-        assignment that doesn't fit this window (crew now starts elsewhere) is
-        simply ignored by Gurobi, so a stale start can never make the model wrong.
+        Why hints, not Var.Start: a rolling window only flies its committed region
+        and leaves the overlap idle (tail flights aren't in F_cov, so covering them
+        isn't rewarded). The carried-over solution therefore touches only a handful
+        of legs in the next window — a near-empty PARTIAL MIP start. Gurobi reacts to
+        a partial start by solving a sub-MIP to "complete" it, and with ~all variables
+        unfixed that completion's root solve alone burned ~80s per window (0 B&B nodes)
+        for a throwaway incumbent — making the warm start net-negative.
+
+        VarHintVal feeds the same information to Gurobi's heuristics/branching WITHOUT
+        the completion sub-MIP, so the overhead disappears while the (small) guidance
+        is kept. Paths are still reconstructed in full (depot → wait-spine → legs) so
+        the hint is coherent rather than a scatter of disconnected arcs.
+
+        Safety: legs matched by (arc_type, flight_id); a crew whose wait-spine can't be
+        rebuilt falls back to a legs-only hint. Hints never constrain the model, so a
+        stale or partial hint can never make it wrong or infeasible.
         """
         if not self._warm_start_routes:
             return
-        n_set = 0
+
+        total_arc_vars = sum(len(v) for v in self.arc_var.values())
+        legs_total = legs_matched = waits_set = 0
+        crew_full = crew_partial = crew_skip = 0
+
         for r in self._warm_start_routes:
             cid = r.get("crew_id")
             cvars = self.arc_var.get(cid)
             if not cvars:
+                crew_skip += 1
                 continue
-            lut = {}
-            for arc, var in cvars.items():
+
+            # (arc_type, flight_id) -> arc for this crew's flight/deadhead arcs.
+            fl_lut: dict[tuple, Arc] = {}
+            for arc in cvars:
                 if arc.flight_id is not None:
-                    lut[(arc.arc_type, arc.flight_id)] = var
-            for leg in r.get("legs", []):
-                fid = leg.get("flight_id")
-                if fid is None:
-                    continue
-                var = lut.get((leg.get("type"), fid))
-                if var is not None:
-                    var.Start = 1.0
-                    n_set += 1
-        if n_set:
-            self.model.update()
-            if self.verbose:
-                print(f"  Warm start: seeded {n_set} flight/deadhead "
-                      f"assignments from the previous window")
+                    fl_lut[(arc.arc_type, arc.flight_id)] = arc
+
+            # Prior legs that could exist in THIS window (dep within its span),
+            # in time order.
+            prior_legs = sorted(
+                (l for l in r.get("legs", [])
+                 if l.get("flight_id") is not None
+                 and self.depot_start <= l.get("dep", -1) < self.horizon_end),
+                key=lambda l: l.get("dep", 0),
+            )
+
+            # Map to the arcs that actually exist in this window's graph.
+            chain: list[Arc] = []
+            for l in prior_legs:
+                legs_total += 1
+                arc = fl_lut.get((l.get("type"), l.get("flight_id")))
+                if arc is not None:
+                    chain.append(arc)
+                    legs_matched += 1
+            if not chain:
+                crew_skip += 1
+                continue
+
+            # Walk the wait spine to stitch depot → leg1 → leg2 → … into one flow.
+            start_ap = self.crew_start_airport.get(cid, self.crew_by_id[cid].base)
+            cur = Node(start_ap, self.depot_start)
+            to_set: list = []
+            consistent = True
+            for arc in chain:
+                wait_vars = self._wait_chain_vars(cid, cur, arc.start)
+                if wait_vars is None:
+                    consistent = False
+                    break
+                to_set.extend(wait_vars)
+                to_set.append(cvars[arc])
+                cur = arc.end
+
+            if consistent and to_set:
+                for v in to_set:
+                    v.VarHintVal = 1.0
+                waits_set += len(to_set) - len(chain)
+                crew_full += 1
+            else:
+                # Fallback: hint just the matched legs.
+                for arc in chain:
+                    cvars[arc].VarHintVal = 1.0
+                crew_partial += 1
+
+        self.model.update()
+        if self.verbose:
+            n = legs_matched + waits_set
+            pct = 100.0 * n / max(1, total_arc_vars)
+            print(f"  Warm start (hints): {crew_full} full + {crew_partial} partial "
+                  f"+ {crew_skip} skipped crew | legs {legs_matched}/{legs_total} matched "
+                  f"| +{waits_set} wait arcs | {n}/{total_arc_vars} arc vars hinted ({pct:.1f}%)")
+
+    def _wait_chain_vars(self, cid: int, from_node: Node, to_node: Node):
+        """Vars for this crew's wait arcs forming the ground spine from_node→to_node
+        (same airport, non-decreasing time). Returns the list (possibly empty if the
+        nodes coincide) or None if no consistent spine exists / a wait var is missing
+        from this crew's reachable set."""
+        if from_node == to_node:
+            return []
+        if from_node.airport != to_node.airport or from_node.time > to_node.time:
+            return None
+        cvars = self.arc_var.get(cid, {})
+        out: list = []
+        cur = from_node
+        guard = 0
+        while cur != to_node:
+            guard += 1
+            if guard > 100_000:
+                return None
+            warc = self.wait_arc_by_start.get(cur)
+            if warc is None or warc.end.time > to_node.time:
+                return None
+            var = cvars.get(warc)
+            if var is None:
+                return None
+            out.append(var)
+            cur = warc.end
+        return out
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -2308,6 +2353,28 @@ class CrewDDDNetwork:
 # RESULT SERIALISATION  (single combined JSON across all windows)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def home_break_windows(base: str, legs: list[dict]) -> list[dict]:
+    """Mandatory 48h home-break intervals for a crew, derived from its committed
+    legs. After any away-spell that reaches the D_AWAY cap, the crew owes a 48h
+    break at home, during which it is unavailable. Returns [{start,end,type}] so
+    the visualiser can read availability truth instead of re-deriving it (which it
+    did incompletely — it had no model of this break). Cheap O(legs) post-solve pass.
+    """
+    flt = sorted([l for l in legs if l.get("type") in ("flight", "deadhead")],
+                 key=lambda l: l.get("dep", 0))
+    out: list[dict] = []
+    away_since = None
+    for l in flt:
+        if l.get("from") == base and l.get("to") != base and away_since is None:
+            away_since = l.get("dep")
+        if l.get("to") == base and away_since is not None:
+            if l.get("arr", 0) - away_since >= DELTA_AWAY:
+                ret = l.get("arr", 0)
+                out.append({"start": ret, "end": ret + 48 * 60, "type": "home_48h"})
+            away_since = None
+    return out
+
+
 def save_combined_result(
     window_results: list[dict],   # list of (result, cov_flights, win) triples
     crew: list[CrewMember],
@@ -2399,11 +2466,15 @@ def save_combined_result(
                     best[key] = leg
         deduped = sorted(best.values(), key=lambda l: l.get("dep", 0))
         if deduped:
+            base_ap = crew_base.get(cid, "")
             routes.append({
                 "crew_id": cid,
-                "base": crew_base.get(cid, ""),
+                "base": base_ap,
                 "crew_count": 1,
                 "legs": deduped,
+                # Authoritative unavailability windows (mandatory 48h home breaks).
+                # The visualiser should read these rather than re-derive availability.
+                "breaks": home_break_windows(base_ap, deduped),
             })
 
     # ── 3. Aggregate uncovered flights (deduplicated) ──────────────────────────
@@ -2592,7 +2663,6 @@ def main(
     out_dir: str = ".",
     verbose: bool = True,
     airlines_filter: Optional[list[str]] = None,
-    random_min_crew: Optional[bool] = None,
 ):
     """
     Load flights → split by airline → solve each independently
@@ -2604,29 +2674,18 @@ def main(
         out_dir        : directory for JSON result files
         verbose        : print detailed DDD iteration info
         airlines_filter: if given, only solve these carriers (e.g. ['AA', 'DL'])
-        random_min_crew: None -> use module flag RANDOM_MIN_CREW; True/False to force
-                         drawing min cabin crew randomly (constant per flight number)
-                         vs. reading MIN_CABIN_CREW from the CSV.
     """
     import time as _t
     os.makedirs(out_dir, exist_ok=True)
     t_global = _t.time()
     horizon_days = days + T_DAYS_TAIL
 
-    use_random = RANDOM_MIN_CREW if random_min_crew is None else random_min_crew
-    if use_random:
-        crew_src = (f"RANDOM per flight number "
-                    f"(range {RANDOM_MIN_CREW_MIN}-{RANDOM_MIN_CREW_MAX}, "
-                    f"seed {RANDOM_SEED})")
-    else:
-        crew_src = "from CSV MIN_CABIN_CREW"
     print(f"Loading flights from {csv_path}...")
     print(f"  Planning period: {days} days  |  Horizon: {horizon_days} days")
-    print(f"  Min cabin crew : {crew_src}")
+    print(f"  Min cabin crew : from CSV MIN_CABIN_CREW")
 
     flights_by_airline, week_start = parse_flights_by_airline(
         csv_path, days=days, horizon_days=horizon_days,
-        random_min_crew_override=use_random,
     )
 
     if airlines_filter:
@@ -2684,28 +2743,7 @@ if __name__ == "__main__":
                     help="planning/coverage period in days (default: %(default)s)")
     ap.add_argument("airline", nargs="?", default=None,
                     help="airline code (e.g. AA) or list number; prompts if omitted")
-    # ── randomized minimum cabin crew ──
-    ap.add_argument("--random-min-crew", action="store_true",
-                    help="draw min cabin crew randomly instead of reading "
-                         "MIN_CABIN_CREW from the CSV; the draw is constant per "
-                         "flight number across all of its occurrences")
-    ap.add_argument("--random-min-crew-min", type=int, default=RANDOM_MIN_CREW_MIN,
-                    metavar="N", help="inclusive lower bound for the draw "
-                                      "(default: %(default)s)")
-    ap.add_argument("--random-min-crew-max", type=int, default=RANDOM_MIN_CREW_MAX,
-                    metavar="N", help="inclusive upper bound for the draw "
-                                      "(default: %(default)s)")
-    ap.add_argument("--seed", type=int, default=RANDOM_SEED, metavar="N",
-                    help="random seed for the min-crew draw (default: %(default)s)")
     args = ap.parse_args()
-
-    if args.random_min_crew_min > args.random_min_crew_max:
-        ap.error("--random-min-crew-min must be <= --random-min-crew-max")
-
-    # Push CLI options into the module config that random_min_crew() reads.
-    RANDOM_MIN_CREW_MIN = args.random_min_crew_min
-    RANDOM_MIN_CREW_MAX = args.random_min_crew_max
-    RANDOM_SEED         = args.seed
 
     path = args.path
     days = args.days
@@ -2737,4 +2775,4 @@ if __name__ == "__main__":
 
     print(f"\nSelected airline: {airline} ({_counts[airline]:,} flights)")
     main(path, days=days, out_dir="results", verbose=True,
-         airlines_filter=[airline], random_min_crew=args.random_min_crew)
+         airlines_filter=[airline])
