@@ -136,11 +136,6 @@ C_UNC_EFFECTIVE = 10**8
 DELTA_BUCKET = 15     # initial time-bucket (min)
 DDD_MAX_VIOLATIONS = 500
 DDD_MAX_ITER = 200
-# d_away is a path-history (cumulative time-away) constraint that arc-pruning can
-# only approximate, so it's enforced exactly by lazy covering cuts on the integer
-# solution: solve the MIP, find any away-spell exceeding the cap, forbid it, re-solve.
-# This caps how many cut/re-solve rounds we'll run per window before proceeding.
-D_AWAY_MAX_CUT_ITERS = 8
 
 # Opportunity cost model
 FARE_BASE      = 50.0
@@ -1923,121 +1918,6 @@ class CrewDDDNetwork:
                 seen.add((ap, t))
         return result
 
-    def _find_d_away_violations(self) -> list[tuple]:
-        """Walk each crew's integer route and find away-spells exceeding D_AWAY.
-
-        Mirrors the validator exactly: a spell starts when the crew leaves base
-        (away_since = that departure minute) and is checked when it next arrives at
-        base — dur = arrival - away_since. This catches spells where the cap is
-        breached while the crew sits idle at an away airport (on wait arcs), not just
-        on a flight leg, which an arc-only check misses. A crew that enters the window
-        already away is seeded from its carried-in away_since (the spell's original
-        departure in a prior window), so cross-window over-stays are caught too; a
-        spell still open at the horizon is flagged if it is already over the cap.
-
-        Returns one entry per violating spell: (cid, away_since, dep_arc) where
-        dep_arc is the in-window arc that left base, or None when the spell began in
-        a prior window (no in-window departure variable to anchor on).
-        """
-        eps = 0.5
-        prio = {'flight': 0, 'deadhead': 1, 'wait': 2}
-        out: list[tuple] = []
-
-        for cid, cvars in self.arc_var.items():
-            base = self.crew_by_id[cid].base
-
-            # Active out-arc per node (an integer path has exactly one).
-            out_adj: dict[Node, Arc] = {}
-            for arc, var in cvars.items():
-                try:
-                    if var.X <= eps:
-                        continue
-                except AttributeError:
-                    continue
-                ex = out_adj.get(arc.start)
-                if ex is None or prio.get(arc.arc_type, 9) < prio.get(ex.arc_type, 9):
-                    out_adj[arc.start] = arc
-
-            start_ap = self.crew_start_airport.get(cid, base)
-            clk = self.carry_clocks.get(cid, ClockState())
-            if start_ap != base and clk.away_since >= 0:
-                away_since = clk.away_since      # entered mid-spell
-                dep_arc = None
-            else:
-                away_since = None
-                dep_arc = None
-
-            cur = Node(start_ap, self.depot_start)
-            seen: set[Node] = set()
-            last_t = self.depot_start
-            for _ in range(50_000):
-                if cur in seen or cur.time >= self.horizon_end:
-                    break
-                seen.add(cur)
-                arc = out_adj.get(cur)
-                if arc is None:
-                    break
-                last_t = max(last_t, arc.true_end)
-
-                # Spell start: leaving base.
-                if (arc.arc_type in ('flight', 'deadhead')
-                        and arc.start.airport == base
-                        and arc.end.airport != base
-                        and away_since is None):
-                    away_since = arc.start.time
-                    dep_arc = arc
-
-                # Return to base: measure the whole spell, then reset.
-                if arc.end.airport == base and away_since is not None:
-                    if arc.true_end - away_since > DELTA_AWAY:
-                        out.append((cid, away_since, dep_arc))
-                    away_since = None
-                    dep_arc = None
-
-                cur = arc.end
-
-            # Spell still open at the horizon and already over the cap.
-            if away_since is not None and (last_t - away_since) > DELTA_AWAY:
-                out.append((cid, away_since, dep_arc))
-
-        return out
-
-    def _add_d_away_cut(self, cid: int, t0: int, dep_arc: Optional[Arc]) -> bool:
-        """Add a covering cut forbidding the away-spell anchored at t0.
-
-        Lets R = the crew's base-return arcs that depart after t0 and arrive by the
-        4-day deadline t0+DELTA_AWAY. For an in-window spell: x_dep ≤ Σ_R (taking the
-        base-departure forces a timely return; if R is empty the cut becomes x_dep ≤ 0,
-        i.e. that stranding departure is forbidden). For a spell carried in from a
-        prior window there is no in-window departure variable, so the crew is already
-        committed to being away and we require Σ_R ≥ 1 — unless R is empty, in which
-        case no compliant return exists (a structural orphan) and we skip rather than
-        make the model infeasible. Returns True iff a cut was added.
-        """
-        base = self.crew_by_id[cid].base
-        cvars = self.arc_var[cid]
-        deadline = t0 + DELTA_AWAY
-        R = [cvars[a] for a in cvars
-             if a.arc_type in ('flight', 'deadhead')
-             and a.end.airport == base
-             and a.start.time > t0
-             and a.true_end <= deadline]
-
-        if dep_arc is not None:
-            dvar = cvars.get(dep_arc)
-            if dvar is None:
-                return False
-            self.model.addConstr(dvar <= gp.quicksum(R), name=f"daway_{cid}_{dep_arc.id}")
-            return True
-
-        if not R:
-            if self.verbose:
-                print(f"    d_away: crew {cid} carried in away with no compliant return "
-                      f"by deadline {deadline} — structural, skipping")
-            return False
-        self.model.addConstr(gp.quicksum(R) >= 1, name=f"daway_{cid}_entry_{t0}")
-        return True
-
     def make_integer(self):
         """Constraint 4' (slide 30): switch to binary/integer."""
         for cvars in self.arc_var.values():
@@ -2055,7 +1935,7 @@ class CrewDDDNetwork:
         2. Detect violations
         3. Refine: insert nodes, bisect wait arcs, expose new arcs
         4. Repeat until no violations
-        5. Switch to MIP (binary), solve with MIPGap=0.01, TimeLimit=300s
+        5. Switch to MIP (binary), solve with MIPGap=0.01, TimeLimit=600s
         """
         print(f"\n  === DDD Solve (window {self.win.idx}) ===")
         solved = False
@@ -2128,7 +2008,7 @@ class CrewDDDNetwork:
             GRB.MINIMIZE,
         )
         self.model.setParam("MIPGap", 0.01)
-        self.model.setParam("TimeLimit", 300)
+        self.model.setParam("TimeLimit", 600)
         # Speed hints for the (highly symmetric) per-crew MIP.  Crew at the same
         # base — and the m_f interchangeable FAs on each flight — create large
         # orbits that stall branch-and-bound; these help without touching the
@@ -2142,43 +2022,7 @@ class CrewDDDNetwork:
         self.model.setParam("Threads", 0)
         # Seed the previous window's solution as a MIP start (no-op for window 0).
         self._apply_warm_start()
-
-        # ── d_away enforcement via lazy covering cuts ──────────────────────────
-        # Arc-pruning can't enforce a cumulative time-away limit (the MIP recombines
-        # individually-legal arcs into an over-cap route), so we solve, detect any
-        # away-spell past the 4-day cap on the integer solution, add a covering cut
-        # forbidding it, and re-solve — until clean, all remaining are structural
-        # (no compliant return exists), or we hit the cut-iteration cap.
-        n_cuts = 0
-        for cut_it in range(D_AWAY_MAX_CUT_ITERS + 1):
-            self.model.optimize()
-            if (self.model.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL)
-                    or self.model.SolCount == 0):
-                break
-            if cut_it == D_AWAY_MAX_CUT_ITERS:
-                if self.verbose:
-                    print(f"  d_away: hit cut-iteration cap ({D_AWAY_MAX_CUT_ITERS}); "
-                          f"proceeding with current solution ({n_cuts} cuts added)")
-                break
-            viols = self._find_d_away_violations()
-            if not viols:
-                if cut_it > 0 and self.verbose:
-                    print(f"  d_away: clean after {cut_it} cut pass(es), {n_cuts} cut(s) total")
-                break
-            added = 0
-            for cid, t0, dep_arc in viols:
-                if self._add_d_away_cut(cid, t0, dep_arc):
-                    added += 1
-            n_cuts += added
-            if added == 0:
-                if self.verbose:
-                    print(f"  d_away: {len(viols)} violation(s) but none cuttable "
-                          f"(structural); stopping")
-                break
-            self.model.update()
-            if self.verbose:
-                print(f"  d_away cut pass {cut_it + 1}: {len(viols)} violation(s) "
-                      f"→ +{added} cut(s) ({n_cuts} total); re-solving")
+        self.model.optimize()
 
         return self.extract_solution()
 
