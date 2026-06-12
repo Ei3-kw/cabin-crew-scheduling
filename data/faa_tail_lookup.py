@@ -191,11 +191,62 @@ def estimate_min_cabin_crew(seats):
 
     if seats <= 50:
         return 1
-    elif seats <= 100:
+    if seats <= 100:
         return 2
+    # ceiling division: 2 + ceil((seats - 100) / 50)
+    return 2 + (-(-(seats - 100) // 50))
+
+
+# -- Random cabin-crew option --------------------------------------------------
+#
+# Alternative to the 121.391 regulatory floor: assign a RANDOM minimum cabin crew
+# per flight, held CONSTANT for a given flight number across all of its occurrences
+# (i.e. the same scheduled flight on different days/times always gets the same
+# value). Deterministic / reproducible via --seed: each value is drawn from a
+# per-key RNG seeded on (seed, carrier, flight number), so it does not depend on row
+# order or how many times the flight appears.
+
+import random
+
+# BTS column-name candidates for carrier and flight number.
+_CARRIER_COLS = ["OP_CARRIER", "OP_UNIQUE_CARRIER", "MKT_UNIQUE_CARRIER", "CARRIER"]
+_FLNUM_COLS   = ["OP_CARRIER_FL_NUM", "FL_NUM", "FLIGHT_NUMBER"]
+
+
+def _first_present(columns, candidates):
+    for c in candidates:
+        if c in columns:
+            return c
+    return None
+
+
+def assign_random_min_crew(df, lo, hi, seed):
+    """Return a list of random min-crew values (one per row of df), constant per
+    (carrier, flight number). Also returns (carrier_col, flnum_col, n_unique)."""
+    carrier_col = _first_present(df.columns, _CARRIER_COLS)
+    flnum_col   = _first_present(df.columns, _FLNUM_COLS)
+    if flnum_col is None:
+        raise SystemExit(
+            "[random-min-crew] No flight-number column found (looked for "
+            f"{_FLNUM_COLS}); cannot keep the value constant per flight number."
+        )
+
+    flnum = df[flnum_col].astype(str).str.strip()
+    if carrier_col is not None:
+        carrier = df[carrier_col].astype(str).str.strip()
     else:
-        # ceiling division: 2 + ceil((seats - 100) / 50)
-        return 2 + (-(-(seats - 100) // 50))
+        carrier = [""] * len(df)
+
+    cache = {}
+    values = []
+    for c, n in zip(carrier, flnum):
+        key = (c, n)
+        v = cache.get(key)
+        if v is None:
+            v = random.Random(f"{seed}|{c}|{n}").randint(lo, hi)
+            cache[key] = v
+        values.append(v)
+    return values, carrier_col, flnum_col, len(cache)
 
 
 # -- Bulk mode -----------------------------------------------------------------
@@ -369,7 +420,23 @@ def main():
         default="bulk",
         help="bulk = download full FAA registry (recommended); scrape = per-tail HTTP lookup",
     )
+    parser.add_argument(
+        "--random-min-crew",
+        action="store_true",
+        help="ignore the 14 CFR 121.391 seat-based value and instead draw a RANDOM "
+             "MIN_CABIN_CREW per flight, held constant per flight number across all "
+             "of its occurrences (reproducible via --seed)",
+    )
+    parser.add_argument("--random-min-crew-min", type=int, default=1, metavar="N",
+                        help="inclusive lower bound for the random draw (default: 1)")
+    parser.add_argument("--random-min-crew-max", type=int, default=3, metavar="N",
+                        help="inclusive upper bound for the random draw (default: 3)")
+    parser.add_argument("--seed", type=int, default=42, metavar="N",
+                        help="random seed for the min-crew draw (default: 42)")
     args = parser.parse_args()
+
+    if args.random_min_crew_min > args.random_min_crew_max:
+        parser.error("--random-min-crew-min must be <= --random-min-crew-max")
 
     print(f"[main] Reading {args.input}...")
     flights = pd.read_csv(args.input, dtype=str, low_memory=False)
@@ -422,14 +489,28 @@ def main():
         f"         No seat data found      : {no_seats:,} flights"
     )
 
-    # Step 3: minimum cabin crew per 14 CFR 121.391
-    enriched["MIN_CABIN_CREW"] = enriched["SEATS_RESOLVED"].apply(
-        estimate_min_cabin_crew
-    )
-    print(
-        "[main] MIN_CABIN_CREW added "
-        "(14 CFR 121.391: 1 FA<=50 seats, 2 FA<=100, +1 per 50 above 100)"
-    )
+    # Step 3: minimum cabin crew
+    if args.random_min_crew:
+        lo, hi = args.random_min_crew_min, args.random_min_crew_max
+        values, carrier_col, flnum_col, n_unique = assign_random_min_crew(
+            enriched, lo, hi, args.seed
+        )
+        enriched["MIN_CABIN_CREW"] = values
+        crew_mode_label = f"random {lo}-{hi}"
+        key_desc = flnum_col if carrier_col is None else f"{carrier_col}+{flnum_col}"
+        print(
+            f"[main] MIN_CABIN_CREW added (RANDOM, range {lo}-{hi}, seed {args.seed}; "
+            f"constant per {key_desc}; {n_unique:,} unique flight numbers)"
+        )
+    else:
+        enriched["MIN_CABIN_CREW"] = enriched["SEATS_RESOLVED"].apply(
+            estimate_min_cabin_crew
+        )
+        crew_mode_label = "14 CFR 121.391"
+        print(
+            "[main] MIN_CABIN_CREW added "
+            "(14 CFR 121.391: 1 FA<=50 seats, 2 FA<=100, +1 per 50 above 100)"
+        )
 
     enriched.to_csv(args.output, index=False)
     print(f"\n[main] Saved to {args.output}")
@@ -469,7 +550,8 @@ def main():
         )
 
         col_widths = [30, 14, 18, 26]
-        headers    = ["aircraft_model", "num_flights", "seats (median)", "min_crew (14 CFR 121.391)"]
+        headers    = ["aircraft_model", "num_flights", "seats (median)",
+                      f"min_crew ({crew_mode_label})"]
         divider    = "-" * sum(col_widths)
 
         print("".join(h.ljust(w) for h, w in zip(headers, col_widths)))
@@ -485,8 +567,12 @@ def main():
         enriched.drop(columns=["_seats", "_crew"], inplace=True)
 
     print("=" * 75)
-    print("\nNote: MIN_CABIN_CREW is the regulatory floor (14 CFR 121.391).")
-    print("Actual airline staffing is typically higher.")
+    if args.random_min_crew:
+        print(f"\nNote: MIN_CABIN_CREW is RANDOM ({crew_mode_label}, seed {args.seed}), "
+              "constant per flight number. Not a regulatory value.")
+    else:
+        print("\nNote: MIN_CABIN_CREW is the regulatory floor (14 CFR 121.391).")
+        print("Actual airline staffing is typically higher.")
 
 
 if __name__ == "__main__":

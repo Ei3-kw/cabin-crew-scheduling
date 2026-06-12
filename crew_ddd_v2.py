@@ -76,10 +76,19 @@ from gurobipy import GRB
 # PARAMETERS  (aligned with slides 9–11)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Duty / rest limits (slide 11)
+DELTA_TA    = 45      # min turnaround between flights at same airport (min)
+DELTA_REST  = 8 * 60  # min rest before next duty (min) = 480
+DELTA_DUTY  = 14 * 60 # max on-duty time per day (min) = 840
+DELTA_HB    = 48 * 60 # min home break (min) = 2880
+D_WORK      = 3       # max consecutive duty days
+D_AWAY      = 4       # return window in days
+DELTA_AWAY  = D_AWAY * 1440  # in minutes
+
 # Rolling horizon (slide 20)
 T_DAYS_SOLVE   = 7    # solve window length in days
 T_DAYS_COMMIT  = 3    # days committed per step
-T_DAYS_TAIL    = 7    # return tail days
+T_DAYS_TAIL    = D_AWAY    # return tail days
 T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 
 # Crew limits (slide 9)
@@ -106,23 +115,12 @@ C_WT  = 0.5           # per minute of wait
 C_OV  = 500.0         # flat penalty per overnight stay (wait ≥ 4 h)
 C_UNC = 107.0         # penalty per uncovered crew slot (slide 10 raw value)
 
-# Duty / rest limits (slide 11)
-DELTA_TA    = 45      # min turnaround between flights at same airport (min)
-DELTA_REST  = 8 * 60  # min rest before next duty (min) = 480
-DELTA_DUTY  = 14 * 60 # max on-duty time per day (min) = 840
-DELTA_HB    = 48 * 60 # min home break (min) = 2880
-D_WORK      = 3       # max consecutive duty days
-D_AWAY      = 4       # return window in days
-DELTA_AWAY  = D_AWAY * 1440  # in minutes
-
 
 C_UNC_EFFECTIVE = 10**8
 
 
 # DDD solver (slide 11)
-DELTA_BUCKET = 15     # initial time-bucket (min)
-DDD_MAX_VIOLATIONS = 500
-DDD_MAX_ITER = 200
+DELTA_BUCKET = 15     # node-snap tolerance (min); constructor default for time_bucket
 
 # Opportunity cost model
 FARE_BASE      = 50.0
@@ -1084,109 +1082,6 @@ class CrewDDDNetwork:
                   f"{n_dijkstra} Dijkstra calls, avg {avg_arcs:.0f}/{len(self.arcs)} "
                   f"arcs reachable per group  ({_t.time()-t0:.1f}s)")
 
-    def add_node(self, airport: str, time: int):
-        """DDD refinement: insert a new node, rewire wait arcs, expose new flight arcs."""
-        import bisect
-        new_node = Node(airport=airport, time=time)
-        if new_node in self.nodes:
-            return
-
-        self._add_node_sorted(new_node)
-
-        ap_nodes = self.nodes_by_airport[airport]
-        times = [n.time for n in ap_nodes]
-        pos = bisect.bisect_left(times, time)
-
-        prev_node = ap_nodes[pos - 1] if pos > 0 else None
-        next_node = ap_nodes[pos + 1] if pos + 1 < len(ap_nodes) else None
-
-        # Step 1: Remove stale spanning wait arc before recomputing reachability
-        # so Dijkstra does not traverse an arc that is about to be split.
-        if prev_node and prev_node in self.wait_arc_by_start:
-            old_arc = self.wait_arc_by_start[prev_node]
-            if old_arc.end.time >= new_node.time:
-                self._remove_arc(old_arc)
-                del self.wait_arc_by_start[prev_node]
-
-        # Step 2: Recompute reachability after removing the stale arc.
-        # new_node has no arcs yet so Dijkstra won't visit it -- that is fine;
-        # home-spine wait arcs bypass the reachability check in _crew_can_use_arc.
-        if self.model is not None and self._base_reachable_arcs:
-            _sv, self.verbose = self.verbose, False
-            self._compute_base_reachability()
-            self.verbose = _sv
-
-        # Step 3: Pre-create placeholder flow balance constraints for new_node.
-        # CRITICAL: these must exist before _make_wait_arc so that
-        # _add_arc_var_for_crew's chgCoeff calls for arc.end == new_node land
-        # on a real constraint instead of being silently dropped.
-        # Placeholder "0 == 0" is correct: new_node is never a depot or horizon
-        # (those exist from network build time), so its RHS is always 0.
-        # The actual arc variables are chgCoeff'd in as the wait/flight arcs run.
-        if self.model is not None:
-            for cid in list(self.flow_constrs):
-                if new_node not in self.flow_constrs[cid]:
-                    constr = self.model.addConstr(
-                        0.0 == 0.0,
-                        name=f"fb_{cid}_{new_node.airport}_{new_node.time}"
-                    )
-                    self.flow_constrs[cid][new_node] = constr
-
-        # Step 4: Create replacement wait arcs.
-        # Reachability is fresh and flow constraints exist for new_node,
-        # so _add_arc_var_for_crew can correctly wire variable coefficients.
-        _base_airports = set(c.base for c in self.crew)
-        _hb = airport if airport in _base_airports else ""
-        if prev_node:
-            self._make_wait_arc(prev_node, new_node, home_base=_hb)
-        if next_node:
-            self._make_wait_arc(new_node, next_node, home_base=_hb)
-
-        # Step 5: Expose new flight/deadhead arcs at new_node.
-        self._expose_flight_arcs_from(new_node)
-        self._expose_flight_arcs_to(new_node)
-
-        # Step 6: Refresh reachability so subsequent add_node calls see the
-        # newly reachable flight arcs.
-        if self.model is not None and self._base_reachable_arcs:
-            _sv, self.verbose = self.verbose, False
-            self._compute_base_reachability()
-            self.verbose = _sv
-
-    def _expose_flight_arcs_from(self, node: Node):
-        for f in self.flights:
-            if f.origin != node.airport or f.dep_min != node.time:
-                continue
-            arr_node = self._snap_arrival(f.dest, f.arr_min)
-            if arr_node is None:
-                continue
-            duty_at_dep = self.min_duty_at.get(node, 0)
-            if duty_at_dep + f.duration > DELTA_DUTY:
-                continue
-            self._make_arc(node, arr_node, f.arr_min,
-                           f.duration * C_FL, 'flight', f.id)
-            self._make_arc(node, arr_node, f.arr_min,
-                           deadhead_cost(f), 'deadhead', f.id)
-
-    def _expose_flight_arcs_to(self, node: Node):
-        for f in self.flights:
-            if f.dest != node.airport:
-                continue
-            dep_node = self._find_node_at_or_before(f.origin, f.dep_min)
-            if dep_node is None or dep_node.time != f.dep_min:
-                continue
-            duty_at_dep = self.min_duty_at.get(dep_node, 0)
-            if duty_at_dep + f.duration > DELTA_DUTY:
-                continue
-            # Check snap: does this flight's arrival snap to node?
-            snapped = self._snap_arrival(f.dest, f.arr_min)
-            if snapped != node:
-                continue
-            self._make_arc(dep_node, node, f.arr_min,
-                           f.duration * C_FL, 'flight', f.id)
-            self._make_arc(dep_node, node, f.arr_min,
-                           deadhead_cost(f), 'deadhead', f.id)
-
     # ── Gurobi model (Constraints 1'–4', slides 27–30) ───────────────────────
 
     def build_model(self):
@@ -1706,48 +1601,6 @@ class CrewDDDNetwork:
 
     # ── DDD Solve loop (slides 31–32) ─────────────────────────────────────────
 
-    def inspect_violations(self) -> list[tuple[str, int]]:
-        """
-        Slide 31–32: detect arcs where |t'_snap - t_true| > Δ_bucket,
-        or turnaround infeasible in current discretisation.
-        """
-        eps = 1e-4
-        active_arcs: set[Arc] = set()
-        for cvars in self.arc_var.values():
-            for arc, var in cvars.items():
-                if arc.arc_type in ('flight', 'deadhead'):
-                    try:
-                        if var.X > eps:
-                            active_arcs.add(arc)
-                    except AttributeError:
-                        pass
-
-        violations = []
-        for arc in active_arcs:
-            ap, true_t = arc.end.airport, arc.true_end
-            snap_node = self._find_node_at_or_after(ap, arc.end.time)
-            if snap_node is None or abs(snap_node.time - true_t) > self.time_bucket:
-                violations.append((ap, true_t))
-
-            # Turnaround check
-            for next_arc in self.arcs_from.get(arc.end, []):
-                if next_arc.arc_type not in ('flight', 'deadhead'):
-                    continue
-                if next_arc not in active_arcs:
-                    continue
-                f = next((fl for fl in self.flights if fl.id == next_arc.flight_id), None)
-                if f and arc.true_end + DELTA_TA > f.dep_min:
-                    violations.append((arc.end.airport, arc.true_end + DELTA_TA))
-
-        result = []
-        seen: set[tuple[str, int]] = set()
-        for ap, t in violations:
-            existing = self._find_node_at_or_after(ap, t)
-            if (existing is None or existing.time != t) and (ap, t) not in seen:
-                result.append((ap, t))
-                seen.add((ap, t))
-        return result
-
     def make_integer(self):
         """Constraint 4' (slide 30): switch to binary/integer."""
         for cvars in self.arc_var.values():
@@ -1758,76 +1611,21 @@ class CrewDDDNetwork:
         self.model.setParam("OutputFlag", int(self.verbose))
         self.model.update()
 
-    def solve(self, max_iter: int = DDD_MAX_ITER) -> dict:
+    def solve(self) -> dict:
         """
-        DDD main loop (slides 31–32):
-        1. Solve LP
-        2. Detect violations
-        3. Refine: insert nodes, bisect wait arcs, expose new arcs
-        4. Repeat until no violations
-        5. Switch to MIP (binary), solve with MIPGap=0.01, TimeLimit=300s
+        Solve the window.
+
+        The network is built event-exact (a node at every flight dep/arr plus the
+        turnaround-snap node), so the discretisation has no coarsening to refine:
+        the old DDD refinement loop converged at iteration 0 in every window and
+        never inserted a node.  That loop, its LP-relaxation pre-solve, and the
+        violation/refinement machinery (inspect_violations / add_node /
+        _expose_flight_arcs_*) have been removed.  We build the integer model and
+        hand it straight to Gurobi, which solves its own root relaxation anyway.
         """
-        print(f"\n  === DDD Solve (window {self.win.idx}) ===")
-        solved = False
+        print(f"\n  === Solve (window {self.win.idx}) ===")
 
-        for it in range(max_iter):
-            self.model.setObjective(
-                gp.quicksum(
-                    var.Obj * var
-                    for cvars in self.arc_var.values()
-                    for arc, var in cvars.items()
-                ) + gp.quicksum(C_UNC_EFFECTIVE * v for v in self.slack_var.values()),
-                GRB.MINIMIZE,
-            )
-            self.model.optimize()
-
-            if self.model.Status != GRB.OPTIMAL:
-                print(f"  Iter {it:3d}: INFEASIBLE/UNBOUNDED (status={self.model.Status}) — stopping")
-                if self.model.Status == GRB.INFEASIBLE:
-                    self.model.computeIIS()
-                    iis_constrs = [(c.ConstrName, c.IISConstr)
-                                   for c in self.model.getConstrs() if c.IISConstr]
-                    iis_vars    = [(v.VarName, v.IISLB, v.IISUB)
-                                   for v in self.model.getVars() if v.IISLB or v.IISUB]
-                    print(f"  IIS: {len(iis_constrs)} constraints, {len(iis_vars)} variables")
-                    for name, _ in iis_constrs[:20]:
-                        print(f"    CONSTR: {name}")
-                    for name, lb, ub in iis_vars[:10]:
-                        print(f"    VAR:    {name}  (lb={lb}, ub={ub})")
-                break
-
-            obj = self.model.ObjVal
-            violations = self.inspect_violations()
-            n_viol = len(violations)
-            print(f"  Iter {it:3d}: LP obj={obj:,.1f}  violations={n_viol}")
-
-            if not violations:
-                print("  LP converged → switching to MIP...")
-                solved = True
-                break
-
-            # Cap at 500, sort by airport activity (slide 31)
-            if n_viol > DDD_MAX_VIOLATIONS:
-                ap_activity: dict[str, int] = defaultdict(int)
-                for cvars in self.arc_var.values():
-                    for arc, var in cvars.items():
-                        if arc.arc_type in ('flight', 'deadhead'):
-                            try:
-                                if var.X > 1e-4:
-                                    ap_activity[arc.end.airport] += 1
-                            except AttributeError:
-                                pass
-                violations.sort(key=lambda v: -ap_activity.get(v[0], 0))
-                violations = violations[:DDD_MAX_VIOLATIONS]
-
-            for ap, t in violations:
-                self.add_node(ap, t)
-            self.model.update()
-
-        if not solved:
-            print("  Warning: DDD did not fully converge; solving MIP on current network.")
-
-        # MIP phase (slide 32)
+        # MIP phase (slide 32): flip arc vars to binary and solve once.
         self.make_integer()
         self.model.setObjective(
             gp.quicksum(
@@ -1838,7 +1636,7 @@ class CrewDDDNetwork:
             GRB.MINIMIZE,
         )
         self.model.setParam("MIPGap", 0.01)
-        self.model.setParam("TimeLimit", 300)
+        self.model.setParam("TimeLimit", 600)
         self.model.optimize()
 
         return self.extract_solution()
