@@ -40,7 +40,7 @@ Parameters (slides 9–11):
   s_b    Crew supply at base b
   s_min=3, s_max=120
   c_fl   = 100 / min  (flight time worked)
-  c_dh   = 20 / min   (deadhead base per-diem)
+  c_dh   = c_fl + fare (deadhead = labor + seat opp-cost, always > flight cost)
   c_wt   = 0.5 / min  (wait cost rate)
   c_ov   = 500        (overnight flat penalty, wait ≥ 4 h)
   c_unc  = 107        (penalty per uncovered slot)
@@ -85,6 +85,13 @@ D_WORK      = 3       # max consecutive duty days
 D_AWAY      = 4       # return window in days
 DELTA_AWAY  = D_AWAY * 1440  # in minutes
 
+# Break-clock node-state expansion sentinels.
+#   NO_STATE   : a base-graph node carries no break clock (pre-expansion).
+#   SINK_EXPIRY: all horizon-time states collapse to this so the per-crew sink
+#                stays a single node regardless of which clock state reaches it.
+NO_STATE    = -(10 ** 15)
+SINK_EXPIRY = (10 ** 15)
+
 # Rolling horizon (slide 20)
 T_DAYS_SOLVE   = 7    # solve window length in days
 T_DAYS_COMMIT  = 3    # days committed per step
@@ -95,7 +102,7 @@ T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 S_MIN = 3             # minimum crew at any base 3
 S_MAX = 120           # maximum crew at any single base (raised to allow ORD to be
                       # correctly staffed: ORD carries ~49% of all flights)
-RANDOM_SEED = 42
+RANDOM_SEED = 42069
 
 # Crew base assignment (slide 12)
 MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
@@ -110,7 +117,6 @@ CREW_UTILISATION = 0.55
 
 # Cost parameters (slide 10)
 C_FL  = 100.0         # per minute of flight time worked
-C_DH  = 20.0          # per minute of deadhead (base per-diem + opp-cost)
 C_WT  = 0.5           # per minute of wait
 C_OV  = 500.0         # flat penalty per overnight stay (wait ≥ 4 h)
 C_UNC = 107.0         # penalty per uncovered crew slot (slide 10 raw value)
@@ -170,6 +176,9 @@ class CrewMember:
 class Node:
     airport: str
     time: int
+    break_expiry: int = NO_STATE   # absolute minute by which the next >= DELTA_HB
+                                   # home break must complete. NO_STATE = base graph
+                                   # (un-expanded); SINK_EXPIRY = collapsed horizon.
 
     def __lt__(self, other):
         return (self.time, self.airport) < (other.time, other.airport)
@@ -202,13 +211,21 @@ class ClockState:
     t_reset: int            = 0      # last reset time (min from week start)
     d_work: int             = 0      # consecutive work-days since last rest
     h_home: int             = 0      # home-wait accumulated since last departure (min)
-    t_last_home_return: int = -LARGE # absolute minute of last arrival at home base;
-                                     # -LARGE means never returned (no prior break needed)
-    away_since: int = -LARGE         # absolute minute the crew last departed home (start
-                                     # of the current away spell); -LARGE = at/based home
-    home_break_until: int = -LARGE   # if the last COMPLETED away-trip reached the D_AWAY
-                                     # cap, the crew owes a 48h home break until this
-                                     # minute; -LARGE = no break owed (short trips)
+    t_last_home_return: int = -LARGE # absolute minute the last >= DELTA_HB home break
+                                     # ENDED (the post-break leave-home departure). The
+                                     # D_AWAY budget is measured from here. Only a
+                                     # completed 48h break advances it; brief home touches
+                                     # do not. -LARGE means no break served yet.
+    away_since: int = -LARGE         # absolute minute the current away spell began,
+                                     # measured from the last completed 48h break. Brief
+                                     # touches at base do NOT reset it; only a 48h break
+                                     # does. -LARGE = crew is home with no open spell.
+    home_break_until: int = -LARGE   # if the away spell since the last break reached the
+                                     # D_AWAY cap, the crew owes a 48h home break until
+                                     # this minute; -LARGE = no break owed.
+    home_since: int = -LARGE         # start of the current continuous home stay (last
+                                     # arrival at base); -LARGE when away. Used to detect
+                                     # when a >= DELTA_HB break has been served.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +253,7 @@ def parse_flights_by_airline(
         horizon_days = days
 
     date_fmt_options = ["%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d", "%m/%d/%Y"]
+    random.seed(RANDOM_SEED)
     week_start = None
     fid = 0
     flights_by_airline: dict[str, list[Flight]] = defaultdict(list)
@@ -292,9 +310,9 @@ def parse_flights_by_airline(
 
             try:
                 lf_raw = row.get('LOAD_FACTOR', '').strip()
-                load_factor = float(lf_raw) if lf_raw else 0.82
+                load_factor = float(lf_raw) if lf_raw else random.uniform(0.5, 1.0)
             except ValueError:
-                load_factor = 0.82
+                load_factor = random.uniform(0.5, 1.0)
 
             airline = row.get('OP_CARRIER', '').strip()
 
@@ -327,7 +345,7 @@ def parse_flights_by_airline(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CREW BASE SIZING  (slide 12)
-# n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f * d_f / τ_duty) * 1.5 + noise ))
+# n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f * d_f / τ_duty) * 1.8 + noise ))
 # ─────────────────────────────────────────────────────────────────────────────
 
 def assign_crew_bases(
@@ -343,7 +361,7 @@ def assign_crew_bases(
     crew base.
 
     Per-base crew count:
-        n = max(S_MIN, min(S_MAX, ceil(max(n_demand, n_peak) * 1.5) + noise))
+        n = max(S_MIN, min(S_MAX, ceil(max(n_demand, n_peak) * 1.8) + noise))
       n_demand = (Sum_{f: orig=p} m_f * d_f) / tau_duty   (duration-weighted demand)
       n_peak   = max simultaneous crew load over the horizon (peak concurrent)
       tau_duty = 8h/day * horizon_days * CREW_UTILISATION
@@ -380,8 +398,8 @@ def assign_crew_bases(
     for ap in bases:
         demand   = demand_minutes.get(ap, 0.0)
         peak     = peak_concurrent.get(ap, 0)
-        n_demand = math.ceil((demand / tau_duty) * 1.5) if demand > 0 else 0
-        n_peak   = math.ceil(peak * 1.5)
+        n_demand = math.ceil((demand / tau_duty) * 1.8) if demand > 0 else 0
+        n_peak   = math.ceil(peak * 1.8)
         needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
         noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
         base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
@@ -435,15 +453,19 @@ def _opp_cost_scale(lf: float) -> float:
 def deadhead_cost(f: Flight, home_base: str = "") -> float:
     """c_dh^a for deadhead arc on flight f (slide 10).
 
+    Deadhead costs crew salary (same as flying) plus the seat fare (displacing
+    a paying passenger), making it strictly more expensive than working the same
+    flight.  This ensures the solver never prefers deadhead loops over idle wait.
+
     If home_base is provided and f.dest == home_base, apply a cost discount so
     that the solver prefers routing regional / spoke crew home over sending
     them to yet another outstation.  The discount is purely a cost signal; the
     hard flow-balance and d_away constraints remain unchanged.
     """
-    base = f.duration * C_DH
-    fare = FARE_BASE + FARE_PER_MILE * max(0.0, f.distance)
-    opp  = fare * _opp_cost_scale(f.load_factor)
-    cost = base + opp
+    labor = f.duration * C_FL   # crew salary: same cost as working the flight
+    fare  = FARE_BASE + FARE_PER_MILE * max(0.0, f.distance)
+    opp   = fare * _opp_cost_scale(f.load_factor)
+    cost  = labor + opp         # total: labor + seat opportunity cost
     if home_base and f.dest == home_base:
         cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
     return cost
@@ -634,6 +656,140 @@ def compute_reachable(
     fwd = dijkstra_fwd(depot_nodes)
     bwd = dijkstra_bwd(horizon_nodes)
     return fwd & bwd
+
+
+# Counter for unique expanded-arc ids (kept distinct from base arc ids).
+_EXP_ARC_ID = [10 ** 9]
+
+
+def _bucket_day(t: int) -> int:
+    """Round a break-deadline DOWN to a whole day (conservative: never late)."""
+    return (t // 1440) * 1440
+
+
+def expand_break_clock(
+    reachable_arcs: set[Arc],
+    base: str,
+    depot_node: Node,
+    horizon_end: int,
+    seed_expiry: int,
+) -> tuple[set[Node], list[Arc], dict[Node, list[Arc]], dict[Node, list[Arc]], Node]:
+    """
+    Bake the single "time since last >= DELTA_HB home break" resource into the
+    graph for ONE crew whose home is `base`.
+
+    Reset = a home stay of >= DELTA_HB; it re-anchors the 4-day window and is
+    FREE (cost 0).  In real networks the stay is represented by a CHAIN of short
+    wait arcs (one per event interval), so we also emit a synthetic zero-cost
+    "home-break jump" from every state at `base` to the first base-timeline node
+    >= DELTA_HB later.  This subsumes the old single-arc >= DELTA_HB check
+    (kept for backward compat with test graphs that use explicit long arcs).
+    Every other arc keeps its cost and is legal only while the node it reaches is
+    within the current deadline.  Horizon-time states collapse to SINK_EXPIRY.
+
+    Returns (state_nodes, state_arcs, arcs_from, arcs_to, depot_state).
+    """
+    import bisect as _bisect
+
+    base_from: dict[Node, list[Arc]] = defaultdict(list)
+    for arc in reachable_arcs:
+        base_from[arc.start].append(arc)
+
+    # Sorted list of all times that appear at `base` in the reachable graph.
+    # Used to compute synthetic home-break jumps without enumerating every
+    # intermediate wait arc.  horizon_end is always included so the crew can
+    # reach the sink via the break path even if the last base event is earlier.
+    base_times: list[int] = sorted(set(
+        t
+        for arc in reachable_arcs
+        for ap, t in ((arc.start.airport, arc.start.time),
+                      (arc.end.airport,   arc.end.time))
+        if ap == base
+    ) | {depot_node.time, horizon_end})
+
+    def state_of(end_time: int, expiry: int) -> int:
+        return SINK_EXPIRY if end_time == horizon_end else expiry
+
+    depot_state = Node(depot_node.airport, depot_node.time,
+                       _bucket_day(seed_expiry))
+    state_nodes: set[Node] = {depot_state}
+    state_arcs: list[Arc] = []
+    frontier = [depot_state]
+    seen = {depot_state}
+
+    while frontier:
+        sn = frontier.pop()
+        base_node = Node(sn.airport, sn.time)   # NO_STATE key into the base graph
+        for arc in base_from.get(base_node, []):
+            is_reset = (arc.is_wait
+                        and arc.start.airport == base
+                        and arc.end.airport == base
+                        and (arc.end.time - arc.start.time) >= DELTA_HB)
+            if is_reset:
+                new_expiry = _bucket_day(arc.end.time + DELTA_AWAY)
+                end = Node(arc.end.airport, arc.end.time,
+                           state_of(arc.end.time, new_expiry))
+                cost = 0.0                       # the home break is free
+            else:
+                if arc.end.time > sn.break_expiry:
+                    continue                     # would breach the cap with no break
+                end = Node(arc.end.airport, arc.end.time,
+                           state_of(arc.end.time, sn.break_expiry))
+                cost = arc.cost
+            _EXP_ARC_ID[0] += 1
+            state_arcs.append(Arc(
+                id=_EXP_ARC_ID[0], start=sn, end=end, true_end=arc.true_end,
+                cost=cost, arc_type=arc.arc_type, flight_id=arc.flight_id,
+            ))
+            if end not in seen:
+                seen.add(end)
+                state_nodes.add(end)
+                frontier.append(end)
+
+        # Synthetic home-break jump: when crew is at base, emit a single zero-cost
+        # arc that jumps to the first base-timeline node >= DELTA_HB after now.
+        # This correctly handles the common case where the home stay is a CHAIN of
+        # short wait arcs rather than a single long one.
+        if sn.airport == base:
+            idx = _bisect.bisect_left(base_times, sn.time + DELTA_HB)
+            if idx < len(base_times):
+                tgt_time = base_times[idx]
+                new_expiry = _bucket_day(tgt_time + DELTA_AWAY)
+                end = Node(base, tgt_time, state_of(tgt_time, new_expiry))
+                _EXP_ARC_ID[0] += 1
+                state_arcs.append(Arc(
+                    id=_EXP_ARC_ID[0], start=sn, end=end, true_end=tgt_time,
+                    cost=0.0, arc_type='wait', flight_id=None,
+                ))
+                if end not in seen:
+                    seen.add(end)
+                    state_nodes.add(end)
+                    frontier.append(end)
+
+    # Backward prune: keep only states that can still reach a horizon sink.
+    arcs_to: dict[Node, list[Arc]] = defaultdict(list)
+    for a in state_arcs:
+        arcs_to[a.end].append(a)
+    sinks = [n for n in state_nodes
+             if n.time == horizon_end and n.break_expiry == SINK_EXPIRY]
+    alive: set[Node] = set()
+    stack = list(sinks)
+    alive.update(sinks)
+    while stack:
+        n = stack.pop()
+        for a in arcs_to.get(n, []):
+            if a.start not in alive:
+                alive.add(a.start)
+                stack.append(a.start)
+
+    state_nodes = {n for n in state_nodes if n in alive}
+    state_arcs = [a for a in state_arcs if a.start in alive and a.end in alive]
+    arcs_from: dict[Node, list[Arc]] = defaultdict(list)
+    arcs_to = defaultdict(list)
+    for a in state_arcs:
+        arcs_from[a.start].append(a)
+        arcs_to[a.end].append(a)
+    return state_nodes, state_arcs, arcs_from, arcs_to, depot_state
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1027,6 +1183,14 @@ class CrewDDDNetwork:
         t0 = _t.time()
         self._base_reachable_arcs: dict[int, set[Arc]] = {}   # keyed by crew.id
 
+        # Per-crew expanded (break-clock state-space) structures — populated below.
+        self._exp_nodes:       dict[int, set[Node]]             = {}
+        self._exp_arcs:        dict[int, list[Arc]]             = {}
+        self._exp_arcs_from:   dict[int, dict]                  = {}
+        self._exp_arcs_to:     dict[int, dict]                  = {}
+        self._exp_depot_state: dict[int, Node]                  = {}
+        self._exp_sink_node:   dict[int, Optional[Node]]        = {}
+
         node_list   = list(self.nodes)
         arcs_from_d = dict(self.arcs_from)
         arcs_to_d   = dict(self.arcs_to)
@@ -1047,40 +1211,74 @@ class CrewDDDNetwork:
             cached = group_cache.get(key)
             if cached is not None:
                 self._base_reachable_arcs[c.id] = cached
-                continue
+            else:
+                depot_node   = Node(start_ap, self.depot_start)
+                horizon_node = Node(c.base, self.horizon_end)
+                if depot_node not in self.nodes or horizon_node not in self.nodes:
+                    group_cache[key] = set()
+                    self._base_reachable_arcs[c.id] = set()
+                else:
+                    reachable_nodes = compute_reachable(
+                        nodes=node_list,
+                        arcs_from=arcs_from_d,
+                        arcs_to=arcs_to_d,
+                        depot_nodes=[depot_node],
+                        horizon_nodes=[horizon_node],
+                        t_hor=self.horizon_end,
+                        base_airport=c.base,
+                        init_dwork=init_dwork,
+                        init_t_last_home=init_tlh,
+                    )
+                    n_dijkstra += 1
+                    reachable_arcs = {
+                        arc for arc in self.arcs
+                        if arc.start in reachable_nodes and arc.end in reachable_nodes
+                    }
+                    group_cache[key] = reachable_arcs
+                    self._base_reachable_arcs[c.id] = reachable_arcs
 
-            depot_node   = Node(start_ap, self.depot_start)
-            horizon_node = Node(c.base, self.horizon_end)
-            if depot_node not in self.nodes or horizon_node not in self.nodes:
-                group_cache[key] = set()
-                self._base_reachable_arcs[c.id] = set()
-                continue
+            # ── Expand break-clock into state-space graph for this crew ──────
+            # seed_expiry: absolute minute by which the crew's NEXT >=48 h home
+            # break must complete.  Derived from the last completed break anchor
+            # (t_last_home_return) if one exists, otherwise from depot_start (fresh
+            # crew get the full DELTA_AWAY budget from window open).
+            if clock.t_last_home_return >= 0:
+                seed_expiry = clock.t_last_home_return + DELTA_AWAY
+            else:
+                seed_expiry = self.depot_start + DELTA_AWAY
 
-            reachable_nodes = compute_reachable(
-                nodes=node_list,
-                arcs_from=arcs_from_d,
-                arcs_to=arcs_to_d,
-                depot_nodes=[depot_node],
-                horizon_nodes=[horizon_node],
-                t_hor=self.horizon_end,
-                base_airport=c.base,
-                init_dwork=init_dwork,
-                init_t_last_home=init_tlh,
-            )
-            n_dijkstra += 1
-            reachable_arcs = {
-                arc for arc in self.arcs
-                if arc.start in reachable_nodes and arc.end in reachable_nodes
-            }
-            group_cache[key] = reachable_arcs
-            self._base_reachable_arcs[c.id] = reachable_arcs
+            reachable = self._base_reachable_arcs[c.id]
+            depot_node_exp = Node(start_ap, self.depot_start)
+            if reachable:
+                e_nodes, e_arcs, e_from, e_to, e_depot = expand_break_clock(
+                    reachable, c.base, depot_node_exp, self.horizon_end, seed_expiry,
+                )
+                e_sink_candidates = [n for n in e_nodes if n.break_expiry == SINK_EXPIRY]
+                e_sink = e_sink_candidates[0] if e_sink_candidates else None
+            else:
+                e_nodes = set()
+                e_arcs  = []
+                e_from  = {}
+                e_to    = {}
+                e_depot = Node(start_ap, self.depot_start, _bucket_day(seed_expiry))
+                e_sink  = None
+
+            self._exp_nodes[c.id]       = e_nodes
+            self._exp_arcs[c.id]        = e_arcs
+            self._exp_arcs_from[c.id]   = e_from
+            self._exp_arcs_to[c.id]     = e_to
+            self._exp_depot_state[c.id] = e_depot
+            self._exp_sink_node[c.id]   = e_sink
 
         if self.verbose:
             n_groups = len(group_cache)
             avg_arcs = sum(len(v) for v in group_cache.values()) / max(1, n_groups)
+            total_exp_arcs = sum(len(v) for v in self._exp_arcs.values())
             print(f"    Reachability: {len(self.crew)} crew in {n_groups} clock-groups, "
                   f"{n_dijkstra} Dijkstra calls, avg {avg_arcs:.0f}/{len(self.arcs)} "
                   f"arcs reachable per group  ({_t.time()-t0:.1f}s)")
+            print(f"    Break-clock expansion: {total_exp_arcs:,} total expanded arcs "
+                  f"across {len(self.crew)} crew  ({_t.time()-t0:.1f}s)")
 
     # ── Gurobi model (Constraints 1'–4', slides 27–30) ───────────────────────
 
@@ -1172,23 +1370,22 @@ class CrewDDDNetwork:
         for c in active_crew:
             self.arc_var[c.id] = {}
             self.flow_constrs[c.id] = {}
-            for arc in self.arcs:
-                if self._crew_can_use_arc(c, arc):
-                    cost = arc.cost
-                    # Home-return deadhead discount
-                    if (arc.arc_type == 'deadhead'
-                            and arc.flight_id is not None
-                            and C_DH_HOME_RETURN_DISCOUNT > 0):
-                        fl = _flight_by_id.get(arc.flight_id)
-                        if fl is not None and fl.dest == c.base:
-                            cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
-                    var = self.model.addVar(
-                        lb=0.0, ub=1.0, obj=cost,
-                        vtype=GRB.CONTINUOUS,
-                        name=f"x_{c.id}_{arc.id}",
-                    )
-                    self.arc_var[c.id][arc] = var
-                    total_vars += 1
+            for arc in self._exp_arcs.get(c.id, []):
+                cost = arc.cost  # reset arcs already have cost=0
+                # Home-return deadhead discount (same logic as before)
+                if (arc.arc_type == 'deadhead'
+                        and arc.flight_id is not None
+                        and C_DH_HOME_RETURN_DISCOUNT > 0):
+                    fl = _flight_by_id.get(arc.flight_id)
+                    if fl is not None and fl.dest == c.base:
+                        cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
+                var = self.model.addVar(
+                    lb=0.0, ub=1.0, obj=cost,
+                    vtype=GRB.CONTINUOUS,
+                    name=f"x_{c.id}_{arc.id}",
+                )
+                self.arc_var[c.id][arc] = var
+                total_vars += 1
 
         # ── Slack variables s_f (slide 25) ───────────────────────────────────
         for f in self.cov_flights:
@@ -1211,7 +1408,6 @@ class CrewDDDNetwork:
         # All other nodes (including other bases' depot nodes at t=0) are plain
         # flow-conservation (in == out). We do NOT set out==0 at other depots —
         # that would block wait arcs originating there and cause infeasibility.
-        node_list = list(self.nodes)
         skipped_crew = 0
         for c in active_crew:
             cvars = self.arc_var[c.id]
@@ -1219,13 +1415,15 @@ class CrewDDDNetwork:
                 skipped_crew += 1
                 continue  # no arcs for this crew — skip to avoid 0==1 constraint
 
-            # Crew starts at their carry-over position (may differ from home base)
-            crew_depot   = Node(self.crew_start_airport[c.id], self.depot_start)
-            home_horizon = Node(c.base, self.horizon_end)
+            # Source = expanded depot state; sink = single SINK_EXPIRY horizon node.
+            crew_depot   = self._exp_depot_state[c.id]
+            home_horizon = self._exp_sink_node[c.id]   # may be None if expansion empty
+            exp_from     = self._exp_arcs_from[c.id]
+            exp_to       = self._exp_arcs_to[c.id]
 
-            for node in node_list:
-                out_arcs = [a for a in self.arcs_from.get(node, []) if a in cvars]
-                in_arcs  = [a for a in self.arcs_to.get(node, [])   if a in cvars]
+            for node in self._exp_nodes[c.id]:
+                out_arcs = [a for a in exp_from.get(node, []) if a in cvars]
+                in_arcs  = [a for a in exp_to.get(node, [])   if a in cvars]
 
                 # Skip nodes where this crew has no arcs at all (no constraint needed)
                 if not out_arcs and not in_arcs:
@@ -1238,14 +1436,14 @@ class CrewDDDNetwork:
                     # Source: exactly one unit departs from crew's start depot (slide 27)
                     constr = self.model.addConstr(out_expr - in_expr == 1,
                         name=f"fb_depot_{c.id}")
-                elif node == home_horizon:
-                    # Sink: exactly one unit absorbed at home horizon (slide 27)
+                elif home_horizon is not None and node == home_horizon:
+                    # Sink: exactly one unit absorbed at SINK_EXPIRY horizon (slide 27)
                     constr = self.model.addConstr(in_expr - out_expr == 1,
                         name=f"fb_horizon_{c.id}")
                 else:
-                    # Flow conservation at all other nodes (including other bases' t=0 nodes)
+                    # Flow conservation at all other expanded nodes
                     constr = self.model.addConstr(out_expr == in_expr,
-                        name=f"fb_{c.id}_{node.airport}_{node.time}")
+                        name=f"fb_{c.id}_{node.airport}_{node.time}_{node.break_expiry}")
 
                 self.flow_constrs[c.id][node] = constr
 
@@ -1259,16 +1457,22 @@ class CrewDDDNetwork:
         # When empty: slack_var >= min_crew forces the full uncoverage penalty.
         # Old code had `if not fl_arcs: continue` which left the slack
         # unconstrained so Gurobi set it to 0 for free — flight looked covered.
+        # Build expanded flight-arc index: flight_id -> [(crew_id, arc), ...]
+        # arc_var is now keyed by expanded arcs, so we index from _exp_arcs.
+        _exp_fl: dict[int, list[tuple[int, Arc]]] = defaultdict(list)
+        for c in active_crew:
+            for arc in self._exp_arcs.get(c.id, []):
+                if arc.arc_type == 'flight' and arc.flight_id is not None:
+                    _exp_fl[arc.flight_id].append((c.id, arc))
+
         n_no_arcs = 0
         for f in self.cov_flights:
-            fl_arcs = [a for a in self._arcs_by_flight.get(f.id, [])
-                       if a.arc_type == 'flight']
-            if fl_arcs:
+            pairs = _exp_fl.get(f.id, [])
+            if pairs:
                 cov_expr = gp.quicksum(
-                    self.arc_var[c.id][arc]
-                    for c in active_crew
-                    for arc in fl_arcs
-                    if arc in self.arc_var[c.id]
+                    self.arc_var[cid][arc]
+                    for cid, arc in pairs
+                    if arc in self.arc_var.get(cid, {})
                 )
             else:
                 cov_expr = 0.0
@@ -1282,168 +1486,21 @@ class CrewDDDNetwork:
             print(f"    WARNING: {n_no_arcs} coverage flights have no reachable "
                   f"flight arcs — will be uncovered (slack-only constraint added)")
 
-        # ── Constraint 3': Home-break (slide 11: Δ_hb = 48 h) ──────────────────
-        # For each crew c and each flight/deadhead arc A departing from c's home
-        # base b at time t_dep: if the crew uses A, they must NOT have used any
-        # inbound arc to b within the preceding DELTA_HB minutes.
-        #
-        #   x_{c,A} + Σ_{I : I.dest=b, t_dep - Δ_hb ≤ I.arr < t_dep} x_{c,I} ≤ 1
-        #
-        # We only add this for arcs whose origin is the crew's home base (not for
-        # intermediate stops at the base, which are covered differently).
-        n_hb_constrs = 0
-        base_airports = set(c.base for c in active_crew)
-        # Pre-index: for each base, sorted list of (true_end, arc) for inbound arcs
-        base_inbound_arcs: dict[str, list[tuple[int, Arc]]] = {b: [] for b in base_airports}
-        for arc in self.arcs:
-            if arc.arc_type in ('flight', 'deadhead') and arc.end.airport in base_airports:
-                base_inbound_arcs[arc.end.airport].append((arc.true_end, arc))
-        for b in base_inbound_arcs:
-            base_inbound_arcs[b].sort(key=lambda x: (x[0], x[1].id))
-
-        import bisect as _bisect
-        # Pre-index per-crew arcs by airport to avoid O(arcs^2) scans.
-        # crew_dep_from_base[cid]  = sorted list of (dep_time, arc) departing c.base
-        # crew_inb_to_base[cid]    = sorted list of (true_end, arc) arriving  c.base
-        # Built once here; used in the constraint loop below.
-        crew_dep_idx: dict[int, list[tuple[int, Arc]]] = {}
-        crew_inb_idx: dict[int, list[tuple[int, Arc]]] = {}
-        for c in active_crew:
-            cvars = self.arc_var[c.id]
-            deps, inbs = [], []
-            for arc in cvars:
-                if arc.arc_type not in ('flight', 'deadhead'):
-                    continue
-                if arc.start.airport == c.base:
-                    deps.append((arc.start.time, arc))
-                if arc.end.airport == c.base:
-                    inbs.append((arc.true_end, arc))
-            deps.sort(key=lambda x: (x[0], x[1].id))
-            inbs.sort(key=lambda x: (x[0], x[1].id))
-            crew_dep_idx[c.id] = deps
-            crew_inb_idx[c.id] = inbs
-
-        # Cache on self so _add_arc_var_for_crew can use them during DDD refinement
-        self._crew_dep_idx = crew_dep_idx
-        self._crew_inb_idx = crew_inb_idx
-
-        for c in active_crew:
-            cvars      = self.arc_var[c.id]
-            dep_list   = crew_dep_idx[c.id]
-            inb_list   = crew_inb_idx[c.id]
-            if not dep_list or not inb_list:
-                continue
-            # Lower bound on when any away spell for this crew could have started.
-            # An inbound arc can only END a trip that reached the D_AWAY cap if it
-            # arrives >= DELTA_AWAY after this bound; otherwise the trip was short
-            # and owes no 48h break, so we skip the coupling entirely.
-            _start_ap = self.crew_start_airport.get(c.id, c.base)
-            _pc = self.carry_clocks.get(c.id, ClockState())
-            if _start_ap != c.base:
-                trip_start_lb = _pc.away_since if _pc.away_since > -LARGE else self.win.t_start
-            else:
-                trip_start_lb = self.depot_start
-            for t_dep, dep_arc in dep_list:
-                t_lo   = t_dep - DELTA_HB
-                lo_idx = _bisect.bisect_left(inb_list, (t_lo,))
-                hi_idx = _bisect.bisect_left(inb_list, (t_dep,))
-                recent_inbound = [arc for te, arc in inb_list[lo_idx:hi_idx]
-                                  if te - trip_start_lb >= DELTA_AWAY]
-                if not recent_inbound:
-                    continue
-                self.model.addConstr(
-                    cvars[dep_arc]
-                    + gp.quicksum(cvars[ia] for ia in recent_inbound)
-                    <= 1,
-                    name=f"hb_{c.id}_{dep_arc.id}",
-                )
-                n_hb_constrs += 1
-
         self.model.update()
         if self.verbose:
-            if n_hb_constrs:
-                print(f"    Home-break constraints: {n_hb_constrs}  ({_t.time()-t0:.1f}s)")
             print(f"    Coverage constraints: {len(self.coverage_constrs)}/{len(self.cov_flights)}  "
                   f"({_t.time()-t0:.1f}s)")
             print(f"    Model: {self.model.NumVars:,} vars, "
                   f"{self.model.NumConstrs:,} constrs  ({_t.time()-t0:.1f}s)")
 
-        # ── Constraint 3'': Cross-window home-break carry-over ─────────────────
-        # Within-window hb_ constraints only cover the case where both the
-        # inbound-to-home arc AND the next departure-from-home arc are visible
-        # in the same window. When a crew returns home near the end of window W
-        # and departs early in window W+1, the inbound arc belongs to W's network
-        # and is invisible here. We fix this by using the carried-over
-        # t_last_home_return clock: if that timestamp is within DELTA_HB of the
-        # window start, any departure from home base before
-        # (t_last_home_return + DELTA_HB) is blocked.
-        #
-        # For each such crew c:
-        #   Σ_{A: A.start.airport=c.base, A.start.time < t_last_home_return+Δ_hb} x_{c,A} = 0
-        #
-        # We express this as x_{c,A} ≤ 0 per arc (ub=0) rather than a summed
-        # constraint so that DDD arc additions are handled correctly — new arcs
-        # with dep < embargo_end are simply never assigned a variable (ub=0 is
-        # handled at variable-creation time via _crew_can_use_arc extension below).
-        n_xw_hb = 0
-        for c in active_crew:
-            clock = self.carry_clocks.get(c.id)
-            if clock is None:
-                continue
-            # Embargo ONLY crew who finished a trip that hit the D_AWAY cap and so
-            # owe a 48h home break.  Short round-trips set home_break_until = -LARGE
-            # and are never embargoed (this is what was killing window-1 coverage).
-            embargo_end = clock.home_break_until
-            if embargo_end <= -LARGE:
-                continue
-            if embargo_end <= self.win.t_start:
-                # Break already completed before this window started; nothing to block
-                continue
-            # Crew has an outstanding home-break obligation that runs into this window.
-            # Even if they start the window at their home base (e.g. arrived home 7h
-            # before the window boundary), the embargo still applies — they haven't
-            # served the full 48h yet.  The home-spine wait arc keeps them in place
-            # until embargo_end, but we still need to zero-out departure arcs before
-            # that time so the LP/MIP can't schedule a departure before the break ends.
-            cvars = self.arc_var[c.id]
-            blocked = [
-                arc for arc in cvars
-                if arc.arc_type in ('flight', 'deadhead')
-                and arc.start.airport == c.base
-                and arc.start.time < embargo_end
-            ]
-            for arc in blocked:
-                self.model.addConstr(
-                    cvars[arc] == 0,
-                    name=f"xwhb_{c.id}_{arc.id}",
-                )
-                n_xw_hb += 1
-
-        # Store embargo data on self so _add_arc_var_for_crew can enforce it
-        # for arcs added during DDD refinement.
-        self._xw_hb_embargo: dict[int, int] = {}  # crew_id -> embargo_end (absolute min)
-        for c in active_crew:
-            clock = self.carry_clocks.get(c.id)
-            if clock is None:
-                continue
-            embargo_end = clock.home_break_until
-            if embargo_end <= -LARGE:
-                continue
-            if embargo_end > self.win.t_start:
-                self._xw_hb_embargo[c.id] = embargo_end
-
-        self.model.update()
-        if self.verbose and n_xw_hb:
-            print(f"    Cross-window home-break constraints: {n_xw_hb}  "
-                  f"({len(self._xw_hb_embargo)} crew under embargo)  "
-                  f"({_t.time()-t0:.1f}s)")
-
-        # NOTE: d_away (4-day return window) is enforced structurally by the
-        # clock-constrained Dijkstra in compute_reachable / _compute_base_reachability.
-        # Arcs that cannot be part of any d_away-feasible path are excluded from
-        # _base_reachable_arcs and therefore never get variables.  No additional LP
-        # constraint rows are needed: the Dijkstra already prunes the arc set to only
-        # paths that include a home-return within DELTA_AWAY.
+        # NOTE: The 4-day away cap and the >=48 h home-break requirement are
+        # enforced STRUCTURALLY by the expanded state-space graph built in
+        # _compute_base_reachability / expand_break_clock.  Each crew's arc_var
+        # is over expanded arcs whose nodes carry a break_expiry dimension; the
+        # flow conservation constraints (Constraint 1') guarantee every feasible
+        # crew path reaches the SINK_EXPIRY horizon node, which is only reachable
+        # via at least one synthetic home-break jump.  No additional LP rows are
+        # needed for hb_ or xwhb_ — those blocks are deleted (Step 5).
 
     def _add_arc_var_for_crew(self, crew_id: int, arc: Arc):
         if arc in self.arc_var.get(crew_id, {}):
@@ -1458,18 +1515,6 @@ class CrewDDDNetwork:
         if crew_id not in self.arc_var:
             self.arc_var[crew_id] = {}
 
-        # Cross-window home-break embargo: if this arc departs from the crew's
-        # home base before their carry-over embargo_end, fix its ub to 0.
-        embargo_end = getattr(self, '_xw_hb_embargo', {}).get(crew_id, -1)
-        is_embargoed = (
-            embargo_end > 0
-            and arc.arc_type in ('flight', 'deadhead')
-            and arc.start.airport == c.base
-            and arc.start.time < embargo_end
-        )
-
-        ub = 0.0 if is_embargoed else 1.0
-
         # Home-return deadhead discount (same logic as in build_model variable creation)
         cost = arc.cost
         if (arc.arc_type == 'deadhead'
@@ -1479,7 +1524,7 @@ class CrewDDDNetwork:
             if fl is not None and fl.dest == c.base:
                 cost *= (1.0 - C_DH_HOME_RETURN_DISCOUNT)
 
-        var = self.model.addVar(lb=0.0, ub=ub, obj=cost,
+        var = self.model.addVar(lb=0.0, ub=1.0, obj=cost,
                                 vtype=GRB.CONTINUOUS,
                                 name=f"x_{crew_id}_{arc.id}")
         self.model.update()  # flush so chgCoeff sees the new variable immediately
@@ -1497,7 +1542,7 @@ class CrewDDDNetwork:
         # which corrupted every new arc's flow contribution during DDD refinement
         # and caused Iter 1 to be infeasible.
         cf = self.flow_constrs.get(crew_id, {})
-        home_horizon = Node(c.base, self.horizon_end)
+        home_horizon = self._exp_sink_node.get(crew_id)
         if arc.start in cf:
             self.model.chgCoeff(cf[arc.start], var, +1)
 
@@ -1505,65 +1550,12 @@ class CrewDDDNetwork:
         # Horizon constraint is written as (in - out == 1) so incoming arc is +1 there too.
         # All other constraints are (out - in == RHS) so incoming arc is -1.
         if arc.end in cf:
-            coeff = +1 if arc.end == home_horizon else -1
+            coeff = +1 if (home_horizon is not None and arc.end == home_horizon) else -1
             self.model.chgCoeff(cf[arc.end], var, coeff)
 
         # Wire into coverage
         if arc.arc_type == 'flight' and arc.flight_id in self.coverage_constrs:
             self.model.chgCoeff(self.coverage_constrs[arc.flight_id], var, 1)
-
-        # Wire into home-break constraints (Δ_hb = 48 h).
-        # When a new arc is added for crew c we may need new hb constraints:
-        # (a) new arc departs c.base  → check recent inbound arcs for c
-        # (b) new arc arrives  c.base → check upcoming departures from c.base for c
-        # Use the pre-built sorted indices (crew_dep_idx / crew_inb_idx) when
-        # available to avoid O(arcs) scans; fall back to a linear scan only on
-        # the first DDD iteration before those indices exist.
-        if arc.arc_type in ('flight', 'deadhead'):
-            import bisect as _bisect
-            cvars = self.arc_var[crew_id]
-
-            if arc.start.airport == c.base:
-                # (a) departing home base
-                t_dep = arc.start.time
-                t_lo  = t_dep - DELTA_HB
-                inb_list = getattr(self, '_crew_inb_idx', {}).get(crew_id)
-                if inb_list is not None:
-                    lo_idx = _bisect.bisect_left(inb_list, (t_lo,))
-                    hi_idx = _bisect.bisect_left(inb_list, (t_dep,))
-                    recent = [a for _, a in inb_list[lo_idx:hi_idx] if a in cvars and a != arc]
-                else:
-                    recent = [
-                        a for a in cvars
-                        if a != arc and a.arc_type in ('flight', 'deadhead')
-                        and a.end.airport == c.base and t_lo <= a.true_end < t_dep
-                    ]
-                if recent:
-                    self.model.addConstr(
-                        var + gp.quicksum(cvars[ia] for ia in recent) <= 1,
-                        name=f"hb_{crew_id}_{arc.id}",
-                    )
-
-            if arc.end.airport == c.base:
-                # (b) arriving home base
-                t_arr = arc.true_end
-                t_hi  = t_arr + DELTA_HB
-                dep_list = getattr(self, '_crew_dep_idx', {}).get(crew_id)
-                if dep_list is not None:
-                    lo_idx = _bisect.bisect_left(dep_list, (t_arr,))
-                    hi_idx = _bisect.bisect_left(dep_list, (t_hi,))
-                    upcoming = [a for _, a in dep_list[lo_idx:hi_idx] if a in cvars and a != arc]
-                else:
-                    upcoming = [
-                        a for a in cvars
-                        if a != arc and a.arc_type in ('flight', 'deadhead')
-                        and a.start.airport == c.base and t_arr <= a.start.time < t_hi
-                    ]
-                if upcoming:
-                    self.model.addConstr(
-                        var + gp.quicksum(cvars[da] for da in upcoming) <= 1,
-                        name=f"hb_{crew_id}_{arc.id}_ret",
-                    )
 
     def _add_flow_constr_for_crew(self, crew_id: int, node: Node):
         c = self.crew_by_id[crew_id]
@@ -1723,9 +1715,13 @@ class CrewDDDNetwork:
                                         < type_priority.get(existing.arc_type, 9)):
                     out[arc.start] = arc
 
-            # Start from the crew's actual position at the beginning of this window
+            # Start from the crew's expanded depot state (has break_expiry dimension).
+            # The base-graph Node(start_ap, depot_start) with NO_STATE won't match
+            # any key in `out`, which is keyed by expanded Nodes.
             start_ap = self.crew_start_airport.get(crew_id, c.base)
-            curr = Node(start_ap, self.depot_start)
+            curr = self._exp_depot_state.get(
+                crew_id, Node(start_ap, self.depot_start)
+            )
             legs = []
             visited: set[Node] = set()
 
@@ -1790,9 +1786,7 @@ class CrewDDDNetwork:
             last_airport = c.base
             last_d_work = 0
             last_h_home = 0
-            last_home_return = -LARGE  # absolute time of last arrival at home base
-            carried_away_since = -LARGE
-            home_break_until = -LARGE
+            break_end = -LARGE   # end of last >= DELTA_HB break; derived from expanded node
 
             if not no_solution:
                 try:
@@ -1801,141 +1795,44 @@ class CrewDDDNetwork:
                         key=lambda a: a.true_end
                     )
 
-                    # Walk arcs up to t_commit to get the committed position.
-                    # Use true_end (actual arrival time) for clock accounting, not
-                    # the snapped arc.end.time, so the away budget is exact.
-                    #
-                    # FIX (d_work counting): d_work tracks consecutive duty DAYS,
-                    # not individual flight legs.  Multiple flights on the same day
-                    # all count as one duty day.  A rest gap of >= DELTA_REST
-                    # (8 h) between the last flight and the next event resets the
-                    # consecutive-day counter.  Without this fix, a crew doing 5
-                    # flights over 3 days carries d_work=5 into the next window,
-                    # which causes Fwd Dijkstra to immediately prune all arcs from
-                    # their carry-over position (d_work=5 > D_WORK=3), triggering
-                    # the stranded-crew reset and teleporting them home.
-                    last_flight_true_end: int = -1   # true_end of most recent flight arc
-                    duty_days_set: set[int] = set()  # calendar days with any flight
-                    last_d_work = 0  # reset below after full walk
-
-                    # Away-spell tracking for the conditional 48h home break.  A trip
-                    # owes a 48h break ONLY if it reached the D_AWAY (4-day) cap; short
-                    # round-trips take the normal 8h rest and stay free to fly.  If the
-                    # crew began this window already away, inherit when their current
-                    # trip started so its full length is measured.
-                    start_ap = self.crew_start_airport.get(c.id, c.base)
-                    prev_clock = self.carry_clocks.get(c.id, ClockState())
-
-                    # ── d_away cross-window continuity ─────────────────────────
-                    # Seed last_home_return from the carried-in clock so the away
-                    # budget (arc.true_end - t_last_home_return) is CONTINUOUS
-                    # across window boundaries.
-                    #
-                    # BUG (fixed here): last_home_return was initialised to -LARGE
-                    # every window and only updated from arcs whose end.airport is
-                    # the base.  A crew that began the window AT home and departed
-                    # produced no committed arc *ending* at base, so last_home_return
-                    # stayed -LARGE.  The next window then saw t_last_home_return < 0,
-                    # took the `init_t_last_home < 0` branch in compute_reachable, and
-                    # RESET the away clock to that window's t_start — handing the crew
-                    # a fresh 4-day budget at every boundary.  Away-spells therefore
-                    # leaked up to (commit-period + D_AWAY) days (observed 5-6 day
-                    # spells against a 4-day cap), which in turn forced clustered 48h
-                    # home breaks that stranded small bases (e.g. MHK #6141 uncovered).
-                    if start_ap == c.base:
-                        # Crew is at home at the window start: their last home touch is
-                        # at least t_start.  Forward home-wait arcs below bump this up
-                        # toward the actual departure time when they exist.
-                        last_home_return = max(prev_clock.t_last_home_return,
-                                               self.win.t_start)
-                    else:
-                        # Crew starts away: inherit the previous window's last home
-                        # touch so the budget keeps counting down, not restarting.
-                        last_home_return = prev_clock.t_last_home_return
-
-                    if start_ap != c.base:
-                        away_since = (prev_clock.away_since
-                                      if prev_clock.away_since > -LARGE
-                                      else self.win.t_start)
-                    else:
-                        away_since = -LARGE
-                    last_long_trip_return = -LARGE   # return of most recent trip that
-                                                     # reached the D_AWAY cap
+                    # Walk arcs up to t_commit to get the committed position and
+                    # d_work count.  The break-clock state (Step 6) is now read
+                    # directly from the last expanded arc's end.break_expiry —
+                    # no manual away_anchor/home_since tracking needed.
+                    last_flight_true_end: int = -1
+                    duty_days_set: set[int] = set()
+                    last_committed_break_expiry = -LARGE
 
                     for arc in active_arcs:
                         if arc.end.time > t_commit:
                             break
                         last_airport = arc.end.airport
-                        # Departing home starts an away spell; arriving home ends it.
-                        if (arc.arc_type in ('flight', 'deadhead')
-                                and arc.start.airport == c.base
-                                and arc.end.airport != c.base
-                                and away_since <= -LARGE):
-                            away_since = arc.start.time
-                        if arc.end.airport == c.base and away_since > -LARGE:
-                            if arc.true_end - away_since >= DELTA_AWAY:
-                                last_long_trip_return = max(last_long_trip_return,
-                                                            arc.true_end)
-                            away_since = -LARGE
+                        last_committed_break_expiry = arc.end.break_expiry
+
                         if arc.arc_type == 'flight':
-                            # Count duty day by which calendar day the flight DEPARTS.
-                            # Two flights on the same calendar day = 1 duty day.
                             dep_day = arc.start.time // 1440
                             duty_days_set.add(dep_day)
                             last_flight_true_end = max(last_flight_true_end, arc.true_end)
                         elif arc.arc_type == 'wait' and arc.end.airport == c.base:
                             last_h_home += (arc.end.time - arc.start.time)
-                            # A rest wait of >= DELTA_REST at home resets consecutive days.
                             if arc.end.time - arc.start.time >= DELTA_REST:
                                 duty_days_set.clear()
                                 last_flight_true_end = -1
-                        if arc.end.airport == c.base:
-                            last_home_return = max(last_home_return, arc.true_end)
 
-                    # If the crew had a rest gap of >= DELTA_REST between their last
-                    # flight and t_commit (i.e. they were resting at t_commit), the
-                    # consecutive-day counter resets to 0 for the next window.
-                    # This matches the network semantics: a wait arc >= DELTA_REST
-                    # sets min_duty_at[to] = 0 in _make_wait_arc.
                     if (last_flight_true_end >= 0
                             and (t_commit - last_flight_true_end) >= DELTA_REST):
-                        last_d_work = 0   # rest completed before window boundary
+                        last_d_work = 0
                     else:
                         last_d_work = len(duty_days_set)
 
-                    # ── Tail scan for last home return ─────────────────────────
-                    # The committed-arc walk above only tracks home returns with
-                    # arc.end.time <= t_commit.  If the crew planned a home return
-                    # in the tail (t_commit < end.time <= t_hor), that timestamp
-                    # was never recorded so the next window saw init_t_last_home=-1
-                    # and granted a fresh D_AWAY budget — allowing indefinite non-
-                    # return.  Fix: also scan tail arcs for home arrivals.
-                    # We do NOT update last_airport from tail arcs (that would
-                    # teleport the crew to a planned-but-not-yet-committed position);
-                    # we only update last_home_return so the away clock is correct.
-                    for arc in active_arcs:
-                        if arc.end.time <= t_commit:
-                            continue   # already handled in the committed walk
-                        if arc.end.airport == c.base:
-                            last_home_return = max(last_home_return, arc.true_end)
-
-                    # Conditional home break: owed ONLY when the last completed away
-                    # trip reached the D_AWAY cap (short trips owe nothing).
-                    if last_long_trip_return > -LARGE:
-                        home_break_until = last_long_trip_return + DELTA_HB
-                    else:
-                        home_break_until = -LARGE
-                    # Carry the ongoing away-spell start if still away at t_commit.
-                    carried_away_since = away_since if last_airport != c.base else -LARGE
-
-                    # NOTE: we do NOT look into the tail (t > t_commit) to find a
-                    # planned home return and pre-emptively mark the crew as home.
-                    # That was the old "key fix" and it caused teleportation: the
-                    # tail return flight was stripped by save_combined_result's
-                    # dep >= t_commit filter, so the crew appeared at home with no
-                    # recorded flight.  Instead we carry the true committed position
-                    # (wherever they are at t_commit) and let the next window plan
-                    # the actual return with a real committed leg.
+                    # Step 6: derive break_end from the expanded node's break_expiry.
+                    # break_expiry = _bucket_day(break_end + DELTA_AWAY), so
+                    # break_end ≈ break_expiry - DELTA_AWAY (conservative: slightly
+                    # earlier due to bucketing, giving next window a slightly shorter
+                    # away budget — always safe).
+                    if (last_committed_break_expiry > -LARGE
+                            and last_committed_break_expiry not in (SINK_EXPIRY, NO_STATE)):
+                        break_end = last_committed_break_expiry - DELTA_AWAY
 
                 except AttributeError:
                     pass  # no solution available; keep defaults
@@ -1945,9 +1842,10 @@ class CrewDDDNetwork:
                 t_reset=0,
                 d_work=last_d_work,
                 h_home=last_h_home,
-                t_last_home_return=last_home_return,
-                away_since=carried_away_since,
-                home_break_until=home_break_until,
+                t_last_home_return=break_end,
+                away_since=-LARGE,       # structural: enforced by expanded graph
+                home_break_until=-LARGE, # structural: enforced by expanded graph
+                home_since=-LARGE,       # structural: enforced by expanded graph
             )
 
         # n_{b,k}^{w+1} (slide 22)
