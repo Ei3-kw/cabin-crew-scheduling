@@ -100,8 +100,7 @@ T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 
 # Crew limits (slide 9)
 S_MIN = 3             # minimum crew at any base 3
-S_MAX = 120           # maximum crew at any single base (raised to allow ORD to be
-                      # correctly staffed: ORD carries ~49% of all flights)
+
 RANDOM_SEED = 42069
 
 # Crew base assignment (slide 12)
@@ -402,7 +401,7 @@ def assign_crew_bases(
         n_peak   = math.ceil(peak * 1.8)
         needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
         noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
-        base_counts[ap] = max(MIN_CREW_PER_BASE, min(S_MAX, noisy))
+        base_counts[ap] = max(MIN_CREW_PER_BASE,  noisy)
 
     # ── Build CrewMember list ─────────────────────────────────────────────────
     crew_list: list[CrewMember] = []
