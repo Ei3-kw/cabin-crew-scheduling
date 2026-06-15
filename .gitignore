@@ -7,3 +7,4 @@ talk/talk.mov
 *.pyc
 /flight-solver-visualizer
 /results
+/.claude
