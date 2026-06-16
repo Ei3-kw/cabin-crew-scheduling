@@ -127,6 +127,23 @@ C_UNC = 107.0         # penalty per uncovered crew slot (slide 10 raw value)
 
 C_UNC_EFFECTIVE = 10**8
 
+# ── Soft look-ahead (seam) coverage ───────────────────────────────────────────
+# Rolling-horizon seam: a flight in the first few hours of a commit window can only
+# be covered if a crew is ALREADY positioned at its (spoke) origin, rested — but the
+# positioning deadhead must depart the evening before, which falls in the PREVIOUS
+# window. That window never sees the flight as a coverage flight (it is past its
+# t_commit), so it has no incentive to pre-position, and the flight is uncovered.
+#
+# Fix: also place a SOFT coverage constraint on flights just past t_commit (the seam
+# zone). The owning window's predecessor then pays C_UNC_LOOKAHEAD if it leaves the
+# seam flight "unplanned", which makes it commit a positioning deadhead (in its own
+# commit region) so the next window inherits a rested crew at the spoke and covers it
+# for real. The penalty must sit between the positioning cost (~1.5e4: deadhead + wait
+# + the leg) and the hard commit penalty (1e8) so the solver pre-positions but NEVER
+# trades a committed cover for a look-ahead one. Set T_LOOKAHEAD_COVER = 0 to disable.
+C_UNC_LOOKAHEAD = 10**6        # soft penalty per look-ahead (seam) coverage slot
+T_LOOKAHEAD_COVER = 12 * 60    # minutes past t_commit to softly cover (half a day)
+
 
 # DDD solver (slide 11)
 DELTA_BUCKET = 15     # node-snap tolerance (min); constructor default for time_bucket
@@ -509,15 +526,25 @@ def build_windows(total_days: int) -> list[Window]:
     return windows
 
 
-def slice_flights(flights: list[Flight], win: Window) -> tuple[list[Flight], list[Flight]]:
+def slice_flights(
+    flights: list[Flight], win: Window
+) -> tuple[list[Flight], list[Flight], list[Flight]]:
     """
     Slide 21:
-      F_w     = {f : t_start ≤ dep_f < t_hor}
-      F_cov_w = {f : dep_f < t_commit}
+      F_w      = {f : t_start ≤ dep_f < t_hor}
+      F_cov_w  = {f : dep_f < t_commit}                         (hard coverage)
+      F_look_w = {f : t_commit ≤ dep_f < t_commit + T_LOOKAHEAD_COVER}  (soft, seam)
+
+    F_look is the look-ahead seam zone: flights just past the commit boundary that get
+    a SOFT coverage incentive so this window pre-positions crew for them (see the
+    C_UNC_LOOKAHEAD comment). They are NOT committed here — the next window covers them
+    for real — so they never count toward this window's uncovered total.
     """
     f_w   = [f for f in flights if win.t_start <= f.dep_min < win.t_hor]
     f_cov = [f for f in f_w     if f.dep_min  <  win.t_commit]
-    return f_w, f_cov
+    look_end = win.t_commit + T_LOOKAHEAD_COVER
+    f_look = [f for f in f_w if win.t_commit <= f.dep_min < look_end] if T_LOOKAHEAD_COVER > 0 else []
+    return f_w, f_cov, f_look
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -848,11 +875,16 @@ class CrewDDDNetwork:
         carry_positions: Optional[dict[str, dict[str, int]]] = None,
         carry_clocks: Optional[dict[int, ClockState]] = None,
         carry_crew_pos: Optional[dict[int, str]] = None,
+        lookahead_flights: Optional[list[Flight]] = None,   # F_look_w (soft seam coverage)
         verbose: bool = True,
     ):
         self.flights    = flights
         self.cov_set    = {f.id for f in cov_flights}
         self.cov_flights = cov_flights
+        # Look-ahead (seam) flights get a SOFT coverage constraint to pre-position crew;
+        # they are never reported as uncovered here. Exclude any that are already hard
+        # coverage flights (disjoint by dep_min, but guard defensively).
+        self.lookahead_flights = [f for f in (lookahead_flights or []) if f.id not in self.cov_set]
         self.crew       = crew
         self.crew_by_id = {c.id: c for c in crew}
         self.win        = win
@@ -1412,6 +1444,7 @@ class CrewDDDNetwork:
                 total_vars += 1
 
         # ── Slack variables s_f (slide 25) ───────────────────────────────────
+        # Hard coverage (commit region): full uncovered penalty.
         for f in self.cov_flights:
             sv = self.model.addVar(
                 lb=0.0, ub=float(f.min_crew),
@@ -1420,11 +1453,22 @@ class CrewDDDNetwork:
                 name=f"slack_{f.id}",
             )
             self.slack_var[f.id] = sv
+        # Soft look-ahead (seam) coverage: smaller penalty so the window pre-positions
+        # crew for the next window's first bank without ever preferring it over a
+        # committed cover. These slacks are excluded from the uncovered report.
+        for f in self.lookahead_flights:
+            sv = self.model.addVar(
+                lb=0.0, ub=float(f.min_crew),
+                obj=C_UNC_LOOKAHEAD,
+                vtype=GRB.CONTINUOUS,
+                name=f"slack_look_{f.id}",
+            )
+            self.slack_var[f.id] = sv
 
         self.model.update()
         if self.verbose:
             print(f"    Variables: {total_vars:,} arc + {len(self.slack_var)} slack  "
-                  f"({_t.time()-t0:.1f}s)")
+                  f"({len(self.lookahead_flights)} look-ahead)  ({_t.time()-t0:.1f}s)")
 
         # ── Constraint 1': Flow balance (slide 27) ────────────────────────────
         # "Crew cannot start from or end at another base's depot/horizon node."
@@ -1506,6 +1550,23 @@ class CrewDDDNetwork:
                 name=f"cov_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
+
+        # Soft look-ahead (seam) coverage constraints. Same shape as the hard ones but
+        # backed by the smaller-penalty slack; a seam flight with no reachable arc in
+        # THIS window simply falls back to slack (no diagnostic — it is not committed).
+        for f in self.lookahead_flights:
+            pairs = _exp_fl.get(f.id, [])
+            cov_expr = gp.quicksum(
+                self.arc_var[cid][arc]
+                for cid, arc in pairs
+                if arc in self.arc_var.get(cid, {})
+            ) if pairs else 0.0
+            constr = self.model.addConstr(
+                cov_expr + self.slack_var[f.id] >= f.min_crew,
+                name=f"cov_look_{f.id}",
+            )
+            self.coverage_constrs[f.id] = constr
+
         if self.verbose and n_no_arcs:
             print(f"    WARNING: {n_no_arcs} coverage flights have no reachable "
                   f"flight arcs — will be uncovered (slack-only constraint added)")
@@ -1536,8 +1597,8 @@ class CrewDDDNetwork:
 
         self.model.update()
         if self.verbose:
-            print(f"    Coverage constraints: {len(self.coverage_constrs)}/{len(self.cov_flights)}  "
-                  f"({_t.time()-t0:.1f}s)")
+            print(f"    Coverage constraints: {len(self.cov_flights)} hard + "
+                  f"{len(self.lookahead_flights)} soft look-ahead  ({_t.time()-t0:.1f}s)")
             print(f"    Model: {self.model.NumVars:,} vars, "
                   f"{self.model.NumConstrs:,} constrs  ({_t.time()-t0:.1f}s)")
 
@@ -1667,12 +1728,15 @@ class CrewDDDNetwork:
 
         # MIP phase (slide 32): flip arc vars to binary and solve once.
         self.make_integer()
+        # Each slack carries its own penalty in .Obj (C_UNC_EFFECTIVE for committed
+        # coverage, C_UNC_LOOKAHEAD for soft seam coverage), so read it per-variable
+        # rather than hardcoding the commit penalty for every slack.
         self.model.setObjective(
             gp.quicksum(
                 var.Obj * var
                 for cvars in self.arc_var.values()
                 for arc, var in cvars.items()
-            ) + gp.quicksum(C_UNC_EFFECTIVE * v for v in self.slack_var.values()),
+            ) + gp.quicksum(v.Obj * v for v in self.slack_var.values()),
             GRB.MINIMIZE,
         )
         self.model.setParam("MIPGap", 0.01)
@@ -2203,13 +2267,14 @@ def solve_airline(
 
     for win in windows:
         t0 = _t.time()
-        f_win, f_cov = slice_flights(flights, win)
+        f_win, f_cov, f_look = slice_flights(flights, win)
 
         if not f_cov:
             print(f"\n  Window {win.idx}: no coverage flights — skipping")
             continue
 
-        print(f"\n  Window {win.idx}: {len(f_win)} total, {len(f_cov)} need coverage  "
+        print(f"\n  Window {win.idx}: {len(f_win)} total, {len(f_cov)} need coverage, "
+              f"{len(f_look)} seam look-ahead  "
               f"[t={win.t_start//1440}d – commit={win.t_commit//1440}d – hor={win.t_hor//1440}d]")
 
         net = CrewDDDNetwork(
@@ -2221,6 +2286,7 @@ def solve_airline(
             carry_positions=carry_positions,
             carry_clocks=carry_clocks,
             carry_crew_pos=carry_crew_pos or None,   # Fix 2: deterministic per-crew positions
+            lookahead_flights=f_look,
             verbose=verbose,
         )
         net.build_initial_network()
