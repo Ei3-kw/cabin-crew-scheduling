@@ -8,3 +8,12 @@ talk/talk.mov
 /flight-solver-visualizer
 /results
 /.claude
+
+# archived / superseded code and duplicate drafts
+/archive
+
+# python bytecode caches
+__pycache__/
+
+# vendored reference clone's virtualenv (not part of this project)
+/crewml-master/venv

@@ -85,6 +85,10 @@ D_WORK      = 3       # max consecutive duty days
 D_AWAY      = 4       # return window in days
 DELTA_AWAY  = D_AWAY * 1440  # in minutes
 
+# Debug: trace one crew's seed/carry clock state across windows (env CREW_DEBUG_ID).
+_DEBUG_CREW_ID = (int(os.environ["CREW_DEBUG_ID"])
+                  if os.environ.get("CREW_DEBUG_ID") else None)
+
 # Break-clock node-state expansion sentinels.
 #   NO_STATE   : a base-graph node carries no break clock (pre-expansion).
 #   SINK_EXPIRY: all horizon-time states collapse to this so the per-crew sink
@@ -706,6 +710,7 @@ def expand_break_clock(
     depot_node: Node,
     horizon_end: int,
     seed_expiry: int,
+    home_carry: int = -LARGE,
 ) -> tuple[set[Node], list[Arc], dict[Node, list[Arc]], dict[Node, list[Arc]], Node]:
     """
     Bake the single "time since last >= DELTA_HB home break" resource into the
@@ -799,8 +804,13 @@ def expand_break_clock(
         # arc that jumps to the first base-timeline node >= DELTA_HB after now.
         # This correctly handles the common case where the home stay is a CHAIN of
         # short wait arcs rather than a single long one.
-        if sn.airport == base and sn.time + DELTA_HB <= sn.break_expiry:
-            idx = _bisect.bisect_left(base_times, sn.time + DELTA_HB)
+        # At the DEPOT, a home break that already started in the previous window
+        # (home_carry) is credited: the 48h completes at home_carry + DELTA_HB, so the
+        # crew only finishes the remaining rest here instead of restarting a full 48h.
+        home_start = home_carry if (sn == depot_state and home_carry >= 0) else sn.time
+        reset_done = home_start + DELTA_HB
+        if sn.airport == base and reset_done <= sn.break_expiry:
+            idx = _bisect.bisect_left(base_times, max(sn.time, reset_done))
             if idx < len(base_times):
                 tgt_time = base_times[idx]
                 new_expiry = _bucket_day(tgt_time + DELTA_AWAY + DELTA_HB)
@@ -1284,7 +1294,21 @@ class CrewDDDNetwork:
                 seed_expiry = clock.t_last_home_return + DELTA_AWAY + DELTA_HB
             else:
                 seed_expiry = self.depot_start + DELTA_AWAY + DELTA_HB
-            gkey = (c.base, start_ap, init_dwork, init_tlh, seed_expiry)
+            # In-progress home break carried across the seam (only meaningful when the
+            # crew starts this window at base): the crew may FINISH the 48h break it
+            # already started, credited from home_carry rather than restarting at depot.
+            home_carry = (clock.home_since
+                          if (start_ap == c.base and clock.home_since >= 0) else -LARGE)
+            gkey = (c.base, start_ap, init_dwork, init_tlh, seed_expiry, home_carry)
+
+            if _DEBUG_CREW_ID is not None and c.id == _DEBUG_CREW_ID:
+                fresh = (not clock.break_in_progress and clock.t_last_home_return < 0)
+                print(f"    [SEED w{self.win.idx}] crew {c.id} base={c.base} "
+                      f"start_ap={start_ap} {'AWAY' if start_ap != c.base else 'home'} "
+                      f"bip={clock.break_in_progress} tlhr={clock.t_last_home_return} "
+                      f"home_carry={home_carry} "
+                      f"seed_expiry={seed_expiry} depot_start={self.depot_start} "
+                      f"{'<<< FRESH RESEED (away-anchor lost)' if (start_ap != c.base and fresh) else ''}")
 
             # ── Reachability (shared by rkey) ─────────────────────────────────
             reachable = reach_cache.get(rkey)
@@ -1315,6 +1339,7 @@ class CrewDDDNetwork:
                 if reachable:
                     e_nodes, e_arcs, e_from, e_to, e_depot = expand_break_clock(
                         reachable, c.base, depot_node_exp, self.horizon_end, seed_expiry,
+                        home_carry=home_carry,
                     )
                     e_sink_c = [n for n in e_nodes if n.break_expiry == SINK_EXPIRY]
                     e_sink = e_sink_c[0] if e_sink_c else None
@@ -1944,55 +1969,66 @@ class CrewDDDNetwork:
         for c in self.crew:
             # v4: per-crew arcs come from the flow decomposition, not per-crew vars.
             crew_arcs = self._crew_active_arcs.get(c.id, [])
-            last_airport = c.base
+            in_clk = self.carry_clocks.get(c.id, ClockState())
+            start_ap0 = self.crew_start_airport.get(c.id, c.base)
+            last_airport = start_ap0
             last_d_work = 0
             last_h_home = 0
-            break_end = -LARGE   # end of last >= DELTA_HB break; derived from expanded node
+            break_end = -LARGE   # away-anchor carried forward (minute crew last left home
+                                 # after a >= DELTA_HB break that completed within commit).
+            # Seed the away-anchor / home-stay continuously from the previous window so the
+            # 4-day budget keeps counting across the seam (depot_start == prev t_commit).
+            away_anchor = in_clk.t_last_home_return if in_clk.t_last_home_return >= 0 else -LARGE
+            home_since  = self.depot_start if start_ap0 == c.base else -LARGE
+            if in_clk.break_in_progress:
+                away_anchor = -LARGE          # clock not started yet
+                home_since  = self.depot_start
 
             if not no_solution:
                 try:
                     active_arcs = sorted(crew_arcs, key=lambda a: a.true_end)
 
-                    # Walk arcs up to t_commit to get the committed position and
-                    # d_work count.  The break-clock state (Step 6) is now read
-                    # directly from the last expanded arc's end.break_expiry —
-                    # no manual away_anchor/home_since tracking needed.
+                    # Walk the COMMITTED arcs (dep < t_commit), tracking the away-anchor
+                    # exactly as validate_availability.py reconstructs it from the merged
+                    # route.  The anchor advances only when a >= DELTA_HB home stay
+                    # completes WITHIN the committed region; a break parked in the tail
+                    # (>= t_commit) is NOT credited, so the next window inherits the open
+                    # budget and must serve the break itself.  This removes the old
+                    # cross-window drift, where the expanded arc's break_expiry credited a
+                    # tail break and silently reset the clock every window.
                     last_flight_true_end: int = -1
                     duty_days_set: set[int] = set()
-                    last_committed_break_expiry = -LARGE
 
                     for arc in active_arcs:
-                        if arc.end.time > t_commit:
+                        # Commit a leg by its DEPARTURE (matching save_combined_result,
+                        # which saves legs with dep < t_commit).
+                        if arc.start.time >= t_commit:
                             break
-                        be = arc.end.break_expiry
                         last_airport = arc.end.airport
-                        last_committed_break_expiry = be
 
-                        if arc.arc_type == 'flight':
-                            dep_day = arc.start.time // 1440
-                            duty_days_set.add(dep_day)
-                            last_flight_true_end = max(last_flight_true_end, arc.true_end)
+                        if arc.arc_type in ('flight', 'deadhead'):
+                            # Arrival at base starts (or continues) a home stay.
+                            if arc.end.airport == c.base and home_since < 0:
+                                home_since = arc.true_end
+                            # Leaving home (re)anchors the away clock — reset only if the
+                            # home stay just left was itself a completed >= DELTA_HB break.
+                            if arc.start.airport == c.base and arc.end.airport != c.base:
+                                served = (home_since >= 0
+                                          and (arc.start.time - home_since) >= DELTA_HB)
+                                if away_anchor < 0 or served:
+                                    away_anchor = arc.start.time
+                                home_since = -LARGE
+                            if arc.arc_type == 'flight':
+                                dep_day = arc.start.time // 1440
+                                duty_days_set.add(dep_day)
+                                last_flight_true_end = max(last_flight_true_end, arc.true_end)
                         elif arc.arc_type == 'wait' and arc.end.airport == c.base:
+                            if home_since < 0:
+                                home_since = arc.start.time
                             last_h_home += (arc.end.time - arc.start.time)
                             if arc.end.time - arc.start.time >= DELTA_REST:
                                 duty_days_set.clear()
                                 last_flight_true_end = -1
-
-                    # Nudge: if the crew is home at t_commit with a tight break
-                    # deadline (must break by ≤ t_commit+DELTA_HB), force
-                    # last_committed_break_expiry = t_commit + DELTA_HB.
-                    # Both t_commit and DELTA_HB are multiples of 1440, so
-                    # _bucket_day(nudge) == nudge and the synthetic-jump guard
-                    # t_commit + DELTA_HB <= nudge passes exactly, placing the
-                    # mandatory break at the very start of the next window's
-                    # committed period — preventing backward-pruning coverage loss
-                    # while eliminating the tail-deferral that caused violations.
-                    if (last_airport == c.base
-                            and last_committed_break_expiry > -LARGE
-                            and last_committed_break_expiry not in (
-                                BREAK_IN_PROGRESS, SINK_EXPIRY, NO_STATE)
-                            and last_committed_break_expiry <= t_commit + DELTA_HB):
-                        last_committed_break_expiry = t_commit + DELTA_HB
 
                     if (last_flight_true_end >= 0
                             and (t_commit - last_flight_true_end) >= DELTA_REST):
@@ -2000,23 +2036,37 @@ class CrewDDDNetwork:
                     else:
                         last_d_work = len(duty_days_set)
 
-                    # Step 6: derive break_end from the expanded node's break_expiry.
-                    # break_expiry = _bucket_day(break_end + DELTA_AWAY + DELTA_HB), so
-                    # break_end ≈ break_expiry - DELTA_AWAY - DELTA_HB (conservative:
-                    # slightly earlier due to bucketing — always safe).
-                    if last_committed_break_expiry == BREAK_IN_PROGRESS:
-                        pass  # break_end stays -LARGE; break_in_progress propagates below
-                    elif (last_committed_break_expiry > -LARGE
-                            and last_committed_break_expiry not in (SINK_EXPIRY, NO_STATE)):
-                        break_end = last_committed_break_expiry - DELTA_AWAY - DELTA_HB
+                    # Carry the away-anchor forward.  Reset (-> break_in_progress, fresh
+                    # clock) only when the crew is home at t_commit AND has served a full
+                    # >= DELTA_HB break that completed by t_commit.  Otherwise carry the
+                    # real anchor so the budget keeps counting; a crew that still owes a
+                    # break is forced to serve it early in the next window.
+                    if (last_airport == c.base and home_since >= 0
+                            and (t_commit - home_since) >= DELTA_HB):
+                        break_end = -LARGE          # fully rested -> fresh (BIP below)
+                    else:
+                        break_end = away_anchor      # away, or owes a break
 
                 except AttributeError:
                     pass  # no solution available; keep defaults
 
-            # Propagate break_in_progress if the crew hasn't departed yet.
+            # Fresh / initial-break state: crew is home at t_commit with the away clock
+            # not running (never left, or a full >= DELTA_HB break completed by t_commit).
             bip = (not no_solution
                    and last_airport == c.base
-                   and last_committed_break_expiry == BREAK_IN_PROGRESS)
+                   and break_end == -LARGE)
+            if _DEBUG_CREW_ID is not None and c.id == _DEBUG_CREW_ID:
+                print(f"    [CARRY w{self.win.idx}] crew {c.id} -> last_airport={last_airport} "
+                      f"{'AWAY' if last_airport != c.base else 'home'} "
+                      f"away_anchor={away_anchor} home_since={home_since} "
+                      f"break_end(tlhr)={break_end} bip={bip} d_work={last_d_work}")
+
+            # Carry the in-progress home stay across the seam: a crew that is home at
+            # t_commit but still owes part of its 48h break (started the break in the
+            # committed window) only needs to FINISH it in the next window — credited
+            # from home_since, not restarted from depot_start.
+            home_carry = home_since if (not bip and last_airport == c.base
+                                        and home_since >= 0) else -LARGE
             crew_pos[c.id] = last_airport
             crew_clock[c.id] = ClockState(
                 t_reset=0,
@@ -2025,7 +2075,7 @@ class CrewDDDNetwork:
                 t_last_home_return=break_end,
                 away_since=-LARGE,       # structural: enforced by expanded graph
                 home_break_until=-LARGE, # structural: enforced by expanded graph
-                home_since=-LARGE,       # structural: enforced by expanded graph
+                home_since=home_carry,   # in-progress home break carried across the seam
                 break_in_progress=bip,
             )
 
@@ -2292,8 +2342,10 @@ def solve_airline(
     # If coverage_days < T_DAYS_COMMIT we still run at least one window.
     effective_days = max(coverage_days, T_DAYS_COMMIT)
     windows = build_windows(effective_days)
+    _max_win = int(os.environ.get("CREW_MAX_WINDOWS", "0")) or len(windows)
     print(f"  Rolling horizon: {len(windows)} windows "
-          f"(T_solve={T_DAYS_SOLVE}d, T_commit={T_DAYS_COMMIT}d, T_tail={T_DAYS_TAIL}d)")
+          f"(T_solve={T_DAYS_SOLVE}d, T_commit={T_DAYS_COMMIT}d, T_tail={T_DAYS_TAIL}d)"
+          + (f"  [CAPPED to first {_max_win}]" if _max_win < len(windows) else ""))
 
     # Crew pool sized on all flights in the airline dataset — or an explicit pool
     # passed by a caller (e.g. the two-layer driver, which solves seniors and normals
@@ -2313,6 +2365,9 @@ def solve_airline(
     window_entries: list[dict] = []   # accumulate for combined save
 
     for win in windows:
+        if win.idx >= _max_win:
+            print(f"\n  [CREW_MAX_WINDOWS] stopping after window {_max_win-1}")
+            break
         t0 = _t.time()
         f_win, f_cov, f_look = slice_flights(flights, win)
 
