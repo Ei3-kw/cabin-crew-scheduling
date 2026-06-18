@@ -13,11 +13,10 @@ Sets & notation:
 
 Parameters:
   δ_f    Flight duration (minutes)
-  dist_f Great-circle distance
   l_f    Passenger load factor ∈ [0,1]
   r_f    Required working crew count
   s_b    Crew supply at base b
-  s_min=3, s_max=120
+  s_min=3
   c_fl   = 100 / min  (flight time worked)
   c_dh   = c_fl + fare (deadhead = labor + seat opp-cost, always > flight cost)
   c_wt   = 0.5 / min  (wait cost rate)
@@ -90,9 +89,6 @@ S_MIN = 3             # minimum crew at any base 3
 
 RANDOM_SEED = 42069
 
-# Crew base assignment
-MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
-
 # Crew utilisation discount for tau_duty (denominator).
 # The raw formula tau = 8h * horizon_days assumes each crew works 8h every day,
 # but home-break (48h), consecutive-day limits (D_WORK=3), and turnaround rest
@@ -105,6 +101,10 @@ CREW_UTILISATION = 0.55
 C_FL  = 100.0         # per minute of flight time worked
 C_WT  = 0.5           # per minute of wait
 C_OV  = 500.0         # flat penalty per overnight stay (wait ≥ 4 h)
+
+# Senior crew cost rates (passed in via solve_airline / CrewNetwork when scheduling seniors)
+C_FL_SENIOR = 420.0   # per minute of flight time for senior crew
+C_WT_SENIOR = 1.0     # per minute of wait for senior crew
 
 # Penalty per uncovered (committed) crew slot, large enough that the solver never
 # trades a committed cover for routing cost.
@@ -126,10 +126,6 @@ C_UNC_EFFECTIVE = 10**8
 # trades a committed cover for a look-ahead one. Set T_LOOKAHEAD_COVER = 0 to disable.
 C_UNC_LOOKAHEAD = 10**6        # soft penalty per look-ahead (seam) coverage slot
 T_LOOKAHEAD_COVER = 12 * 60    # minutes past t_commit to softly cover (half a day)
-
-
-# Time discretisation
-DELTA_BUCKET = 15     # node-snap tolerance (min); constructor default for time_bucket
 
 # Opportunity cost model
 FARE_BASE      = 50.0
@@ -379,7 +375,7 @@ def assign_crew_bases(
     Per-base crew count:
         n_demand = ceil(1.8 * (Sum_{f: orig=p} m_f * d_f) / tau_duty)  (duration-weighted)
         n_peak   = ceil(1.8 * peak concurrent crew load over the horizon)
-        n        = max(n_demand, n_peak, MIN_CREW_PER_BASE), then a 10% Gaussian jitter
+        n        = max(n_demand, n_peak, S_MIN), then a 10% Gaussian jitter
       tau_duty = 8h/day * horizon_days * CREW_UTILISATION
     """
     rng = random.Random(seed)
@@ -416,9 +412,9 @@ def assign_crew_bases(
         peak     = peak_concurrent.get(ap, 0)
         n_demand = math.ceil((demand / tau_duty) * 1.8) if demand > 0 else 0
         n_peak   = math.ceil(peak * 1.8)
-        needed   = max(n_demand, n_peak, MIN_CREW_PER_BASE)
+        needed   = max(n_demand, n_peak, S_MIN)
         noisy    = int(rng.gauss(needed, max(1, needed * 0.10)))
-        base_counts[ap] = max(MIN_CREW_PER_BASE,  noisy)
+        base_counts[ap] = max(S_MIN,  noisy)
 
     # ── Build CrewMember list ─────────────────────────────────────────────────
     crew_list: list[CrewMember] = []
@@ -466,7 +462,7 @@ def _opp_cost_scale(lf: float) -> float:
     return (lf - LF_LOW) / (LF_HIGH - LF_LOW)
 
 
-def deadhead_cost(f: Flight, home_base: str = "") -> float:
+def deadhead_cost(f: Flight, home_base: str = "", c_fl: float = C_FL) -> float:
     """c_dh^a for deadhead arc on flight f.
 
     Deadhead costs crew salary (same as flying) plus the seat fare (displacing
@@ -477,8 +473,11 @@ def deadhead_cost(f: Flight, home_base: str = "") -> float:
     that the solver prefers routing regional / spoke crew home over sending
     them to yet another outstation.  The discount is purely a cost signal; the
     hard flow-balance and d_away constraints remain unchanged.
+
+    c_fl: per-minute flight-time cost rate; defaults to the standard C_FL but
+    can be overridden (e.g. C_FL_SENIOR) to match the crew tier being scheduled.
     """
-    labor = f.duration * C_FL   # crew salary: same cost as working the flight
+    labor = f.duration * c_fl   # crew salary: same cost as working the flight
     fare  = FARE_BASE + FARE_PER_MILE * max(0.0, f.distance)
     opp   = fare * _opp_cost_scale(f.load_factor)
     cost  = labor + opp         # total: labor + seat opportunity cost
@@ -869,13 +868,16 @@ class CrewNetwork:
         cov_flights: list[Flight],     # F_cov_w (need coverage)
         crew: list[CrewMember],
         win: Window,
-        time_bucket: int = DELTA_BUCKET,
         carry_positions: Optional[dict[str, dict[str, int]]] = None,
         carry_clocks: Optional[dict[int, ClockState]] = None,
         carry_crew_pos: Optional[dict[int, str]] = None,
         lookahead_flights: Optional[list[Flight]] = None,   # F_look_w (soft seam coverage)
         verbose: bool = True,
+        cost_fl: float = C_FL,   # per-minute flight cost (override for senior crew)
+        cost_wt: float = C_WT,   # per-minute wait cost  (override for senior crew)
     ):
+        self.c_fl = cost_fl
+        self.c_wt = cost_wt
         self.flights    = flights
         self.cov_set    = {f.id for f in cov_flights}
         self.cov_flights = cov_flights
@@ -888,7 +890,6 @@ class CrewNetwork:
         self.win        = win
         self.horizon_end = win.t_hor
         self.depot_start = win.t_start   # window-relative depot (rolls with each window)
-        self.time_bucket = time_bucket
         self.verbose    = verbose
 
         # Carry-over from previous window
@@ -1115,10 +1116,10 @@ class CrewNetwork:
 
             # Flight arc: cost = c_fl * δ_f
             self._make_arc(dep_node, arr_node, f.arr_min,
-                           f.duration * C_FL, 'flight', f.id)
+                           f.duration * self.c_fl, 'flight', f.id)
             # Deadhead arc: cost = c_dh^a
             self._make_arc(dep_node, arr_node, f.arr_min,
-                           deadhead_cost(f), 'deadhead', f.id)
+                           deadhead_cost(f, c_fl=self.c_fl), 'deadhead', f.id)
             n_arcs += 2
 
         if self.verbose:
@@ -1138,7 +1139,7 @@ class CrewNetwork:
             cost = 0.0
         else:
             overnight = 1 if dt >= OVERNIGHT_THRESHOLD else 0
-            cost = dt * C_WT + overnight * C_OV
+            cost = dt * self.c_wt + overnight * C_OV
         arc = self._make_arc(frm, to, to.time, cost, 'wait')
         self.wait_arc_by_start[frm] = arc
         # Rest resets duty (wait ≥ Δ_rest resets duty clock)
@@ -1559,7 +1560,7 @@ class CrewNetwork:
                 cov_expr = 0.0
                 n_no_arcs += 1
             constr = self.model.addConstr(
-                cov_expr + self.slack_var[f.id] == f.min_crew,
+                cov_expr + self.slack_var[f.id] >= f.min_crew,
                 name=f"cov_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
@@ -1571,7 +1572,7 @@ class CrewNetwork:
             pairs = _exp_fl.get(f.id, [])
             cov_expr = gp.quicksum(self.group_flow[gk][arc] for gk, arc in pairs) if pairs else 0.0
             constr = self.model.addConstr(
-                cov_expr + self.slack_var[f.id] == f.min_crew,
+                cov_expr + self.slack_var[f.id] >= f.min_crew,
                 name=f"cov_look_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
@@ -2332,6 +2333,8 @@ def solve_airline(
     out_dir: str = ".",
     verbose: bool = True,
     crew_override: Optional[list] = None,
+    cost_fl: float = C_FL,   # per-minute flight cost (use C_FL_SENIOR for seniors)
+    cost_wt: float = C_WT,   # per-minute wait cost  (use C_WT_SENIOR for seniors)
 ) -> list[dict]:
     """
     Run full rolling-horizon DDD for one airline.
@@ -2393,12 +2396,13 @@ def solve_airline(
             cov_flights=f_cov,
             crew=crew,
             win=win,
-            time_bucket=DELTA_BUCKET,
             carry_positions=carry_positions,
             carry_clocks=carry_clocks,
             carry_crew_pos=carry_crew_pos or None,   # Fix 2: deterministic per-crew positions
             lookahead_flights=f_look,
             verbose=verbose,
+            cost_fl=cost_fl,
+            cost_wt=cost_wt,
         )
         net.build_initial_network()
         net.build_model()

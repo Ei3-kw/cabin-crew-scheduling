@@ -62,7 +62,8 @@ def solve_two_layer(csv_path, days, airline):
     print(f"  Senior pool sized for 1-per-flight demand: {len(seniors)} seniors")
     _t_l1 = _t.time()
     solver.solve_airline(f"{airline}_L1senior", flights_L1, days,
-                     out_dir=OUT_DIR, crew_override=seniors)
+                     out_dir=OUT_DIR, crew_override=seniors,
+                     cost_fl=solver.C_FL_SENIOR, cost_wt=solver.C_WT_SENIOR)
     l1_secs = _t.time() - _t_l1
     L1 = json.load(open(f"{OUT_DIR}/result_{airline}_L1senior.json"))
     cancelled_keys = {_fkey(u) for u in L1["uncovered_flights"]}
@@ -258,13 +259,23 @@ def _write_substitutions(routes, subs, combined_flights):
 
 def _flights_with_real_min_crew(l1_flights, flights):
     """L1's serialised flights carry min_crew=1 (the senior demand). Patch each back to
-    the real total requirement from the original Flight objects, keyed by id."""
-    real = {f.id: f.min_crew for f in flights}
+    the real total requirement from the original Flight objects.
+
+    Matched by the stable geometry key (flight_num, origin, dest, dep_min), NOT by id.
+    L1's serialised ids are re-indexed by save_combined_result (0..|F_cov|-1, sorted by
+    departure); the original Flight.id is a global parse counter across ALL airlines, so
+    the two id spaces are disjoint. Keying by id matched 0 flights and silently left every
+    flight at min_crew=1, which made _cap_overstaffing deadhead every normal operating leg
+    (normals showed zero flying time). The geometry key matches all flights."""
+    real = {_fkey({"flight_num": f.flight_num, "origin": f.origin,
+                    "dest": f.dest, "dep_min": f.dep_min}): f.min_crew
+            for f in flights}
     out = []
     for ff in l1_flights:
         ff = dict(ff)
-        if ff.get("id") in real:
-            ff["min_crew"] = real[ff["id"]]
+        k = _fkey(ff)
+        if k in real:
+            ff["min_crew"] = real[k]
         out.append(ff)
     return out
 
