@@ -1,11 +1,14 @@
 == Introduction
 === Background Problem
 
-Crew is an airline's second-largest operating cost after fuel, so how flights are staffed has an outsized effect on profitability. The cabin crew pairing problem asks for a set of legal duty sequences -- _pairings_ -- that each begin and end at a crew member's home base, respect working-time regulations, and together cover every scheduled flight at minimum cost. What makes cabin crew harder than cockpit crew is heterogeneity: cabin crew are cross-qualified across aircraft types and are split into classes, and the number of each class a flight needs varies with aircraft size and cabin layout. A regional turboprop may need a single attendant while a widebody needs eight.
+Crew is an airline's second-largest operating cost, behind only fuel, so how flights are staffed has a real effect on profitability. The cabin-crew pairing problem asks for a set of legal duty sequences, or _pairings_, that each begin and end at a crew member's home base, respect working-time rules, and together cover every scheduled flight at minimum cost. Cabin crew are harder to schedule than cockpit crew because they are heterogeneous. They are cross-qualified across aircraft types and split into classes, and how many of each class a flight needs depends on the aircraft's size and cabin layout. A regional turboprop might need a single attendant, while a widebody needs eight.
 
-We adopt this heterogeneity in a deliberately simple form. Every flight has a total crew requirement of between one and eight, of which exactly one must be a _senior_ crew member and the rest may be anyone, normal or senior. Substitution is one-directional: a senior may take a normal seat, but a normal can never fill the senior seat. A flight that cannot be given a senior is therefore cancelled -- it has no qualified crew lead on board -- whereas a flight short only on normal seats is merely understaffed. This asymmetry, rather than the raw crew count, is what shapes the resourcing problem: the senior class is the scarce, binding resource.
+We model this in a deliberately simple form. Each flight needs between one and eight crew. Exactly one must be a _senior_, the rest can be anyone. A senior can fill any seat, but a normal can never fill the senior's. The senior is therefore the scarce, binding resource: it decides whether a flight can be staffed at all.
 
-A pairing is legal only if it obeys the operational clocks the model must track: a minimum turnaround between consecutive flights, a maximum on-duty span before a rest is required, a minimum overnight rest, and a mandatory long home break that bounds how long a crew member may stay away from base. Unlike formulations that plan around a single base and import "extra" crew at a flat penalty, we model the real geography: crew are based at many airports, can only originate and terminate duties at their own base, and must be physically positioned -- by flying or deadheading -- to wherever a flight departs. Coverage is thus limited not just by how many crew exist, but by whether the right class can legally reach the right place at the right time, which is the central tension the rest of this report addresses.
+A pairing is legal only if it respects the operational clocks the model tracks. Two consecutive flights need at least a 45-minute turnaround between them. A duty period can build up at most 14 hours of block time before an 8-hour rest clears it. And a crew member can stay away from base for at most 4 days before owing a 48-hour home break.
+
+
+Unlike formulations that plan around a single base and import "extra" crew at a flat penalty, we model the real geography: crew are based at many airports, can only originate and terminate duties at their own base, and must be physically positioned, by flying or deadheading, to wherever a flight departs. Coverage is thus limited not just by how many crew exist, but by whether the right class can legally reach the right place at the right time. That is the central tension the rest of this report addresses.
 
 === Original Paper's methodology
 
@@ -16,37 +19,81 @@ The flight schedule is real U.S. domestic data from the Bureau of Transportation
 
 $ r_f = ceil(s_f \/ 50) $
 
-// Because the requirement comes straight from the aircraft actually flown, it varies genuinely across flights and across airlines with no hand-tuning: a 50-seat regional jet needs one attendant, a 160-seat narrowbody four, and the largest widebodies eight. An all-regional carrier such as ZW is single-crew throughout, whereas a mixed mainline fleet spans the full range from one to eight.
+After enrichment the dataset spans 21 carriers, from mainline operators down to small regionals. This gives a natural range of network sizes and crew requirements to test against. We treat each carrier independently, with its own flights, airports, and crew pool, so an airline is one self-contained instance. The planning period is 30 days, extended by a return tail to a 34-day horizon so crew committed late can still be routed home. Only flights departing within the planning period must be covered; the rest sit in the tail.
 
-After enrichment the dataset spans 21 carriers, from mainline operators down to small regionals, giving a natural range of network sizes and crew requirements to test against. We treat each carrier independently: it has its own flights, airports, and crew pool, so an airline is one self-contained instance.
+The crew requirement is uneven across carriers, but within a single regional carrier it is essentially constant. A regional flies a near single-class fleet: one aircraft type, one seat band. So every flight maps to the same $r_f$. G7 is two attendants throughout (its regional jets seat 51 to 100), as are ZW and QX. Real per-flight variation appears only at mainline scale, where the fleet spans seat classes. B6 ranges over two to four, HA three to six, and AA three to eight. Size and density climb the same way. The regionals are small and sparse: G7 touches 51 airports over 143 routes, ZW 44 over 93. A mainline such as AA spans 119 airports and 836 routes at several times the density (@instance-table).
 
 #figure(
   table(
     columns: (auto, auto, auto, auto, auto, auto),
-    align: (left, right, left, right, left, right),
-    table.header([*Code*], [*Flights*], [*Code*], [*Flights*], [*Code*], [*Flights*]),
-    [WN], [105,307], [MQ], [21,888], [F9], [15,526],
-    [DL], [76,306],  [OH], [21,092], [PT], [10,621],
-    [AA], [75,088],  [9E], [18,279], [G4], [9,345],
-    [OO], [65,026],  [AS], [18,163], [QX], [7,754],
-    [UA], [62,007],  [B6], [17,918], [HA], [6,690],
-    [YX], [27,854],  [NK], [17,544], [YV], [6,628],
-    [ZW], [3,790],   [G7], [5,575],  [C5], [6,612],
+    align: (left, right, right, right, right, left),
+    table.header([*Carrier*], [*Flights*], [*Airports*], [*Routes*], [*Flights / airport*], [*Min. crew $r_f$*]),
+    [ZW], [3,790],   [44],  [93],    [86],   [2 (uniform)],
+    [G7], [5,575],   [51],  [143],   [109],  [2 (uniform)],
+    [C5], [6,612],   [57],  [116],   [116],  [2 (uniform)],
+    [YV], [6,628],   [69],  [178],   [96],   [2 (uniform)],
+    [HA], [6,690],   [22],  [80],    [304],  [3--6],
+    [QX], [7,754],   [53],  [201],   [146],  [2 (uniform)],
+    [G4], [9,345],   [119], [789],   [79],   [3--4],
+    [PT], [10,621],  [69],  [175],   [154],  [2 (uniform)],
+    [F9], [15,526],  [80],  [624],   [194],  [3--4],
+    [NK], [17,544],  [60],  [433],   [292],  [3--4],
+    [B6], [17,918],  [57],  [281],   [314],  [2--4],
+    [AS], [18,163],  [85],  [357],   [214],  [3--4],
+    [9E], [18,279],  [107], [380],   [171],  [2 (uniform)],
+    [OH], [21,092],  [94],  [375],   [224],  [2 (uniform)],
+    [MQ], [21,888],  [145], [526],   [151],  [2 (uniform)],
+    [YX], [27,854],  [83],  [600],   [336],  [2 (uniform)],
+    [UA], [62,007],  [119], [811],   [521],  [3--8],
+    [OO], [65,026],  [239], [1,231], [272],  [2 (uniform)],
+    [AA], [75,088],  [119], [836],   [631],  [3--8],
+    [DL], [76,306],  [140], [879],   [545],  [2--7],
+    [WN], [105,307], [104], [1,606], [1013], [3--8],
   ),
-  caption: [Operating carriers in the enriched dataset and their flight counts.],
-) <airline-table>
+  caption: [Network size, density (flights per airport) and per-flight crew requirement for every operating carrier in the January 2025 BTS data. _Routes_ counts distinct directed origin--destination pairs.],
+) <instance-table>
 
-A planning period of 30 days is used, extended by a return tail to a 34-day horizon so that crew committed late in the period can still be routed home; only flights departing within the planning period must be covered, the remainder sitting in the tail. We therefore take ZW as our single-crew baseline and the larger regionals and mainlines as the multi-crew cases.
+This leaves an awkward trade-off when picking test instances. The carriers with genuinely varied requirements (B6, HA, AA) are exactly the ones too large to solve in reasonable time. The small regionals that do solve have a flat requirement that never stretches the senior/normal split past a fixed one-plus-one. So we use two complementary instances. On the real data we focus on G7. It is a regional small enough to solve, and its true requirement of two (one senior, one normal) still puts the full two-layer machinery to work on a genuine schedule. For varied demand we keep that same small ZW network but swap its requirement for a random $r_f$, uniform over 1 to 8 (`data/flights_2025-01-random.csv`). That gives the mixed demand of a mainline on a network small enough to solve. It exercises cancellation, multi-seat fill and substitution in ways the uniform regionals never would.
 
 === Two Layer structure
-==== Senior Layer (one senior per flight)
-==== Normal Fill Layer (min_crew − 1)
-==== Cancellation of Senior-less Flights
+
+Each flight needs one senior plus $r_f - 1$ normals. Rather than solve for both at once, we run two passes that each place a single crew member per flight. This is about tractability. The crew-flow relaxation is integral only at unit demand, so the barrier method reaches an integer optimum without branching. The moment a flight needs two or more, the coverage constraints tie the flow across crew groups together, the relaxation turns fractional, and the solver has to branch. Treating the seniors (one per flight) and the normals ($r_f - 1$ per flight) as separate unit-demand passes keeps both in that easy regime. We solve the seniors first because they are the binding resource; the normals then fill in around the schedule the seniors fix.
+
+==== Senior Layer (1 senior per flight)
+
+Pass one stamps every flight with demand one and solves over a dedicated senior pool. Each flight gets exactly one senior, or none if none can legally reach it. A flight that gets no senior is _cancelled_: a normal can never fill the senior seat, so it is dropped and reported uncovered. The rest pass to the normal layer.
+
+==== Normal Fill Layer ($r_f− 1$)
+
+Pass two takes those surviving flights, re-stamps each with demand $r_f - 1$, and solves over a separate normal pool. Flights with $r_f = 1$ are already complete and carry no demand here; $r_f = 2$ stays unit-demand, higher values give small multiplicity. Normal identifiers are offset so they never collide with senior ones on merge.
+
 ==== Senior Substitution in Idle Gaps
-==== Per-Layer Crew Sizing
+
+After both passes, some surviving flights are still short a normal. A senior can fill a normal seat, but only opportunistically: inside an idle gap of its own layer-1 route, never displacing a senior duty. This is a greedy post-processing pass, not part of either MIP. It fills one seat per gap and writes each accepted fill back as a real flight leg on the senior's route, so the schedule, visualiser and validator all reflect it.
+
+An idle gap runs from a senior's arrival at an airport up to its next senior departure, or to the end of its route. A candidate fill flight $f$ must clear two gates.
+
+===== Geometric Feasibility
+The senior must be parked at $f$'s origin, rested across the gap (the 8-hour minimum, so $"dep"_f - "arr"_"prev" >= 480$ min), and, when a senior duty follows the gap, able to connect to it: $f$ must land where that duty departs, leaving the 45-minute turnaround, $"arr"_f + 45 <= "dep"_"next"$. A gap with no following duty clears this trivially.
+
+===== Route Legality
+This is the gate geometry alone misses: a senior parked far from base could satisfy the geometry yet break the away cap by flying a fill hours or days later. So we insert $f$ into the senior's route, re-sort by departure, and re-check the whole route against the same rules the model enforces. No leg may depart more than 4 days after the senior last left home with no 48-hour break in between, and no run of consecutive duty days may exceed the limit. The check is cumulative, so several fills on one senior stay jointly legal. A gap failing either gate yields nothing, which makes the pass best-effort: it recovers a handful of understaffed flights and leaves the rest short.
 
 === Crew Base Allocation
-==== Senior vs Normal Crew
+
+Choosing where crew are based and how many to base there is one heuristic, run once per layer. The base set is every airport the carrier flies both to and from; each such airport is a full crew base. For a base $p$ we estimate two loads. The first is its duration-weighted demand, the crew-minutes that originate there:
+
+$ D_p = sum_(f : "orig"(f) = p) m_f d_f $
+
+where $m_f$ is the layer's per-flight demand (one for the senior pass, $r_f - 1$ for the normal pass) and $d_f$ the block duration. The second is the peak concurrent load $P_p$, the largest number of crew on duty at $p$ at once, found by sweeping the day and adding $m_f$ at each departure, removing it at each arrival.
+
+The pool must exceed the raw demand, since crew are not available the whole horizon. An 8-hour overnight rest separates duty days, and a 48-hour home break follows every rotation of at most 4 days away, so over a six-day cycle only about four days are workable. A utilisation factor $u = 0.55$ absorbs these overheads; it is hand-tuned rather than derived, set empirically so busy bases are not undersized. For sizing we credit each crew a nominal eight duty-hours a day, well below the enforced 14-hour cap, so over the $H$-day horizon one crew supplies $tau = 8"h" times H times u$ duty-minutes. This eight-hour figure is a sizing assumption only; the schedules themselves are bound by the 14-hour duty limit. The base size is then
+
+$ n_p = max(ceil(1.8 thin D_p \/ tau), thin ceil(1.8 thin P_p), thin n_min) $
+
+a $1.8$ slack over the larger load, floored at a small per-base minimum $n_min$, with a 10% Gaussian jitter on each count. The $1.8$ covers positioning (a crew often deadheads to where it is needed) and short demand peaks. It is ample: the pools supply two to nearly five times the crew-minutes flown (a coverage ratio of $2.8$ for G7, around four for the randomised ZW), so headcount is never binding. Coverage is limited by geography and legality, not numbers, so the slack could even be tightened to shrink the model.
+
+Running this twice, on the senior demand and then the normal demand, gives two pools each matched to its own layer. Sizing one pool and splitting it by a fixed ratio was tried first, and it mismatched both layers.
 
 
 == Formulations

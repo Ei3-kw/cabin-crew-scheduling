@@ -1,8 +1,8 @@
 # Cabin Crew Scheduling
 
 Honours thesis project (MATH6007, UQ): solving the **cabin-crew pairing problem** on real
-U.S. domestic flight data with a **Dynamic Discretisation Discovery (DDD)** time-expanded
-network, a rolling-horizon decomposition, and a two-layer senior/normal crew model.
+U.S. domestic flight data with a **time-expanded crew-flow network**, a rolling-horizon
+decomposition, and a two-layer senior/normal crew model.
 
 Given a month of flights — each needing between one and eight cabin crew, exactly one of
 whom must be a *senior* — the solver builds legal duty pairings (respecting turnaround,
@@ -19,7 +19,7 @@ BTS on-time CSV
       ▼
 data/flights_enriched.csv
       │  crew_two_layer.py          (orchestrates two layers; calls the solver twice)
-      │    └─ crew_ddd_v5.py        (DDD network + rolling horizon + group-flow MIP)
+      │    └─ crew_solver.py        (time-expanded network + rolling horizon + group-flow MIP)
       ▼
 results/result_<AIRLINE>_twolayer.json
       │  results/validate_availability.py   (re-checks every rule on the merged routes)
@@ -32,7 +32,7 @@ report/  ·  talk_final/             (Typst write-up and slides)
 
 | Path | Role |
 |------|------|
-| `crew_ddd_v5.py` | **The solver.** DDD time-expanded network with break-clock node expansion, clock-group aggregation, integer group-flow MIP (Gurobi), and flow decomposition back into per-crew routes. Rolling horizon over the planning period. |
+| `crew_solver.py` | **The solver.** Time-expanded crew-flow network with break-clock node expansion, clock-group aggregation, integer group-flow MIP (Gurobi), and flow decomposition back into per-crew routes. Rolling horizon over the planning period. |
 | `crew_two_layer.py` | **Orchestrator** for multi-crew flights. Layer 1 places one senior per flight (`min_crew = 1`); flights with no senior are cancelled. Layer 2 fills the remaining `min_crew − 1` seats with normal crew. Idle seniors can substitute into normal seats. |
 | `data/faa_tail_lookup.py` | Enriches raw BTS flight data with aircraft type and seat count (FAA Aircraft Registry), then maps seats → minimum cabin crew via 14 CFR 121.391 (`ceil(seats / 50)`). |
 | `results/validate_availability.py` | Independent validator: reconstructs each crew's physical timeline from the result JSON and flags continuity, overlap, turnaround, away-cap (`d_away`) and consecutive-duty (`duty_block`) violations. |
@@ -40,7 +40,7 @@ report/  ·  talk_final/             (Typst write-up and slides)
 | `report/` , `talk_final/` | Typst thesis (`report/draft.typ`) and presentation. |
 | `archive/` | Superseded solver versions and abandoned approaches (CP, column generation, DIDP, earlier DDD/flow iterations). Git-ignored; kept locally for reference. |
 
-## Model rules (constants in `crew_ddd_v5.py`)
+## Model rules (constants in `crew_solver.py`)
 
 | Rule | Value |
 |------|-------|
@@ -81,7 +81,7 @@ Running without the airline argument prints the carriers in the file and prompts
 **3. Solve the single-commodity model directly** (treats each flight's `min_crew` as-is):
 
 ```sh
-python3 crew_ddd_v5.py data/flights_enriched.csv 30 G7
+python3 crew_solver.py data/flights_enriched.csv 30 G7
 ```
 
 **4. Validate a result:**
@@ -96,21 +96,23 @@ python3 results/validate_availability.py results/result_G7_twolayer.json
 cd flight-solver-visualizer && bun install && bun run dev
 ```
 
-## Environment knobs (`crew_ddd_v5.py`)
+## Environment knobs (`crew_solver.py`)
 
 | Variable | Effect |
 |----------|--------|
 | `CREW_MAX_WINDOWS=N` | Stop after the first `N` rolling-horizon windows (debugging / fast iteration). |
 | `CREW_DEBUG_ID=<crew_id>` | Trace one crew's seed/carry break-clock state across windows. |
+| `CREW_PROBE=<seconds>` | Adaptive crossover (opt-in): probe each window with no crossover up to this many seconds; if it times out still far from optimal, re-solve with crossover + `MIPFocus=1`. Helps the hard multi-crew windows; off by default. |
 
-The Gurobi `TimeLimit` (1800 s) and `Method` (barrier) are set in `build_model`.
+The Gurobi `TimeLimit` (1800 s) and `Method` (barrier, `Crossover=0`) are set in `build_model`.
 
 ## Data files (`data/`)
 
 | File | Description |
 |------|-------------|
 | `flights_enriched.csv` | Real BTS schedule enriched with seats + min crew (git-ignored; regenerate with step 1). |
-| `flights_2025-01.csv`, `flights_2025-01-random.csv` | Smaller / synthetic-min-crew variants for testing. |
+| `flights_2025-01-random.csv` | Same network as the enriched data but with a random `min_crew ∈ [1,8]` per flight — the heterogeneous-demand instance (used for ZW). Generate via `faa_tail_lookup.py --random-min-crew`. |
+| `flights_2025-01.csv` | January slice with the real seat-derived `min_crew`. |
 | `flights_mini.csv`, `flights_42k.csv` | Tiny and large slices for quick or stress runs. |
 | `faa_registry.csv` | Cached FAA Aircraft Registry (tail → type → seats). |
 
@@ -118,7 +120,13 @@ The Gurobi `TimeLimit` (1800 s) and `Method` (barrier) are set in `build_model`.
 
 - A flight is **cancelled** if it cannot be given a senior, and **understaffed** if it is
   short only on normal seats — the senior class is the binding resource.
-- Coverage and all duty rules are preserved by construction: coverage is a constraint on
-  the integer flow, and every decomposed crew path lives in the break-expanded graph, so
-  the rules hold without a post-hoc re-check. `validate_availability.py` confirms this on
-  the merged, cross-window output.
+- Coverage is an **equality** (`Σ flow + slack = r_f`): the slack absorbs any shortfall and
+  the equality caps operators at `r_f`, so the flow can't over-cover a flight by routing
+  surplus crew through it — they reroute onto deadhead arcs instead.
+- All duty rules are preserved by construction: every decomposed crew path lives in the
+  break-expanded graph, so they hold without a post-hoc re-check. `validate_availability.py`
+  confirms this on the merged, cross-window output.
+- **Test instances**: **G7** on the real enriched data (a tractable regional, uniform 2 crew
+  per flight) is the real-data case; **ZW** on `flights_2025-01-random.csv` (random
+  `min_crew ∈ [1,8]`) is the heterogeneous-demand case. Real per-flight variation only
+  appears at mainline scale, which is too large to solve in reasonable time.

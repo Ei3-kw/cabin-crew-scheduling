@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Two-layer crew scheduling on top of the v5 flow solver.
+Two-layer crew scheduling on top of the crew_solver flow model.
 
 Layer 1 (SENIOR):  every flight needs exactly ONE senior crew (a designated subset
-    of the crew pool). Solved as the v5 min_crew=1 flow — its integral, root-solvable
-    sweet spot. A flight that gets no senior is CANCELLED (no senior on board), and is
-    dropped from layer 2.
+    of the crew pool). Solved as a crew_solver min_crew=1 flow, its integral,
+    root-solvable sweet spot. A flight that gets no senior is CANCELLED (no senior on
+    board) and dropped from layer 2.
 
 Layer 2 (FILL):  every surviving flight needs its remaining (min_crew - 1) seats,
-    filled by NORMAL crew. Solved as a v5 flow over the surviving flights with demand
-    (min_crew - 1).
+    filled by NORMAL crew. Solved as a crew_solver flow over the surviving flights with
+    demand (min_crew - 1).
 
 Senior substitution (a senior filling a normal seat in an idle gap of its layer-1
-    schedule) is NOT yet modelled here — see the note at the bottom. This file builds
-    the two-layer structure + cancellation; substitution is the next increment.
+    schedule) is applied greedily after both layers: can_substitute screens geometry,
+    _sub_keeps_legal checks the away cap and duty limit, and each accepted fill is
+    written back as a real route leg.
 
 Run:  python3 crew_two_layer.py data/flights_enriched.csv 3 ZW
 """
@@ -21,7 +22,7 @@ import sys, os, json
 from dataclasses import replace
 from collections import defaultdict
 
-import crew_ddd_v5 as v5
+import crew_solver as solver
 
 OUT_DIR = "results"
 
@@ -42,7 +43,7 @@ def _flight_obj_key(f):
 def solve_two_layer(csv_path, days, airline):
     import time as _t
     t_start = _t.time()
-    fba, _ = v5.parse_flights_by_airline(csv_path, days)
+    fba, _ = solver.parse_flights_by_airline(csv_path, days)
     if airline not in fba:
         sys.exit(f"airline {airline} not found; have {sorted(fba)[:10]}...")
     flights = fba[airline]
@@ -57,10 +58,10 @@ def solve_two_layer(csv_path, days, airline):
     # min_crew. So size_crew_bases runs on flights stamped min_crew=1.
     print("\n########## LAYER 1 — SENIOR (1 per flight) ##########")
     flights_L1 = [replace(f, min_crew=1) for f in flights]
-    seniors = v5.size_crew_bases(flights_L1)
+    seniors = solver.size_crew_bases(flights_L1)
     print(f"  Senior pool sized for 1-per-flight demand: {len(seniors)} seniors")
     _t_l1 = _t.time()
-    v5.solve_airline(f"{airline}_L1senior", flights_L1, days,
+    solver.solve_airline(f"{airline}_L1senior", flights_L1, days,
                      out_dir=OUT_DIR, crew_override=seniors)
     l1_secs = _t.time() - _t_l1
     L1 = json.load(open(f"{OUT_DIR}/result_{airline}_L1senior.json"))
@@ -80,9 +81,9 @@ def solve_two_layer(csv_path, days, airline):
     _t_l2 = _t.time()
     if flights_L2:
         normals = [replace(c, id=c.id + NORMAL_ID_OFFSET)
-                   for c in v5.size_crew_bases(flights_L2)]
+                   for c in solver.size_crew_bases(flights_L2)]
         print(f"  Normal pool sized for (min_crew-1) fill demand: {len(normals)} normals")
-        v5.solve_airline(f"{airline}_L2normal", flights_L2, days,
+        solver.solve_airline(f"{airline}_L2normal", flights_L2, days,
                          out_dir=OUT_DIR, crew_override=normals)
         L2 = json.load(open(f"{OUT_DIR}/result_{airline}_L2normal.json"))
     else:
@@ -98,6 +99,9 @@ def solve_two_layer(csv_path, days, airline):
 
 DELTA_REST = 8 * 60     # 8h rest
 DELTA_TA   = 45         # 45-min turnaround
+DELTA_HB   = 48 * 60    # 48h home break
+DELTA_AWAY = 4 * 1440   # max time away from base (4 days)
+D_WORK     = 4          # max consecutive duty days (validator threshold)
 
 
 def senior_idle_gaps(route_legs):
@@ -116,26 +120,75 @@ def senior_idle_gaps(route_legs):
 
 
 def can_substitute(gap, F):
-    """Can a senior idle in `gap` fill fill-flight F without contradicting layer 1?
-    It must be parked at F.origin, rested, and after F be able to reach its next senior
-    duty legally (greedy: only if that next duty departs from F.dest, or it has none)."""
+    """Geometric feasibility of a senior in `gap` flying fill-flight F: it must be parked
+    at F.origin, rested, and either bounded by a following senior duty F can connect to,
+    or open-ended (no further duty). Whether actually flying F keeps the route within the
+    away cap and duty-day limit is checked separately by _sub_keeps_legal."""
     O, D, dep, arr = F["origin"], F["dest"], F["dep_min"], F["arr_min"]
     if gap["loc"] != O:
         return False
     if dep - gap["from"] < DELTA_REST:          # not yet rested in this gap
         return False
     nd, nf = gap["next_dep"], gap["next_from"]
-    if nd is None:                               # no further senior duty — free to fly F
+    if nd is None:                               # open-ended gap — no next duty to make
         return True
     # After F the senior is at D at time arr; it must make its next duty (from nf at nd).
     return D == nf and arr + DELTA_TA <= nd
 
 
+def _sub_keeps_legal(existing_legs, F, base):
+    """Would flying fill-flight F keep this senior's route within the 4-day away cap and
+    the consecutive-duty-day limit? Mirrors validate_availability on the route formed by
+    the senior's existing legs plus F. This is what rejects the stranding substitutions
+    (a senior parked far from base, flying a fill days later) while keeping the legal
+    ones, instead of dropping every open-ended fill outright."""
+    legs = sorted(
+        [l for l in existing_legs if l["type"] in ("flight", "deadhead")]
+        + [{"type": "flight", "from": F["origin"], "to": F["dest"],
+            "dep": F["dep_min"], "arr": F["arr_min"]}],
+        key=lambda l: l["dep"])
+    # Away cap: no leg may depart more than DELTA_AWAY after the anchor (the last
+    # leave-home following a completed 48h break), with no break served in between.
+    anchor = None
+    home_since = None
+    for l in legs:
+        if l["from"] == base and l["to"] != base:
+            served = home_since is not None and (l["dep"] - home_since) >= DELTA_HB
+            if anchor is None or served:
+                anchor = l["dep"]
+            home_since = None
+        if l["to"] == base and home_since is None:
+            home_since = l["arr"]
+        if anchor is not None and (l["dep"] - anchor) > DELTA_AWAY:
+            return False
+    # Consecutive duty days without a 48h home break.
+    duty_days = set()
+    prev_home_arr = None
+    loc = base
+    for l in legs:
+        if prev_home_arr is not None and loc == base and (l["dep"] - prev_home_arr) >= DELTA_HB:
+            if len(duty_days) > D_WORK:
+                return False
+            duty_days = set()
+        if l["type"] == "flight":
+            duty_days.add(l["dep"] // 1440)
+        if l["to"] == base:
+            prev_home_arr = l["arr"]
+        loc = l["to"]
+    return len(duty_days) <= D_WORK
+
+
 def apply_substitution(flights, seniors, L1, surviving_keys, understaffed):
-    """Greedy senior substitution: fill the understaffed flights with idle seniors whose
-    layer-1 schedule allows it. Returns the list of (flight, senior_id) substitutions."""
-    senior_gaps = {r["crew_id"]: senior_idle_gaps(r["legs"]) for r in L1.get("routes", [])}
-    used_gap = set()    # (senior_id, gap_index) already spent on a substitution
+    """Greedy senior substitution: fill the understaffed flights with idle seniors. A
+    candidate must be geometrically feasible (can_substitute) AND keep the senior's route
+    legal once F is added (_sub_keeps_legal), checked cumulatively so several fills on one
+    senior stay legal together. Returns the list of (flight, senior_id) substitutions."""
+    routes = L1.get("routes", [])
+    senior_gaps = {r["crew_id"]: senior_idle_gaps(r["legs"]) for r in routes}
+    senior_legs = {r["crew_id"]: r["legs"] for r in routes}
+    senior_base = {r["crew_id"]: r["base"] for r in routes}
+    accepted = defaultdict(list)    # senior_id -> fill legs accepted so far
+    used_gap = set()                # (senior_id, gap_index) already spent on a fill
     subs = []
     for F in understaffed:
         for sid, gaps in senior_gaps.items():
@@ -143,11 +196,16 @@ def apply_substitution(flights, seniors, L1, surviving_keys, understaffed):
             for gi, g in enumerate(gaps):
                 if (sid, gi) in used_gap:
                     continue
-                if can_substitute(g, F):
-                    subs.append((F, sid))
-                    used_gap.add((sid, gi))
-                    placed = True
-                    break
+                if not can_substitute(g, F):
+                    continue
+                if not _sub_keeps_legal(senior_legs[sid] + accepted[sid], F, senior_base[sid]):
+                    continue
+                subs.append((F, sid))
+                used_gap.add((sid, gi))
+                accepted[sid].append({"type": "flight", "from": F["origin"], "to": F["dest"],
+                                      "dep": F["dep_min"], "arr": F["arr_min"]})
+                placed = True
+                break
             if placed:
                 break
     return subs
@@ -172,6 +230,30 @@ def _remap_l2_routes(l2_routes, combined_flights):
         rr["legs"] = legs
         out.append(rr)
     return out
+
+
+def _write_substitutions(routes, subs, combined_flights):
+    """Make the greedy senior substitutions REAL: append a flight leg for each filled
+    flight onto the substituting senior's route (then re-sort by departure), so the
+    schedule, viz and validator actually reflect the senior covering that normal seat in
+    its idle gap. Continuity holds by construction -- can_substitute already verified the
+    senior is parked at the flight's origin and its next senior duty leaves the flight's
+    destination, so the inserted leg slots cleanly between them."""
+    gid = {(f["origin"], f["dest"], f["dep_min"]): f["id"] for f in combined_flights}
+    by_crew = {r["crew_id"]: r for r in routes}
+    n = 0
+    for F, sid in subs:
+        r = by_crew.get(sid)
+        if r is None:
+            continue
+        r["legs"].append({
+            "type": "flight", "from": F["origin"], "to": F["dest"],
+            "dep": F["dep_min"], "arr": F["arr_min"],
+            "flight_id": gid.get((F["origin"], F["dest"], F["dep_min"])),
+        })
+        r["legs"].sort(key=lambda l: l["dep"])
+        n += 1
+    return n
 
 
 def _flights_with_real_min_crew(l1_flights, flights):
@@ -289,13 +371,20 @@ def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
     _combined_flights = _flights_with_real_min_crew(L1.get("flights", []), flights)
     # L1 routes already use global ids; L2 routes must be remapped to them (see above).
     _merged_routes = L1.get("routes", []) + _remap_l2_routes(L2.get("routes", []), _combined_flights)
-    # Normalise any flow-model over-coverage: surplus operators -> deadhead.
+    # Normalise any flow-model over-coverage: surplus operators -> deadhead. Runs BEFORE
+    # writing substitutions, so the (intentional) substitution legs added next are not
+    # mistaken for over-coverage and stripped back to deadhead.
     _n_capped = _cap_overstaffing(_merged_routes, _combined_flights, {c.id for c in seniors})
     if _n_capped:
         print(f"  normalised {_n_capped} surplus operator leg(s) -> deadhead (over-coverage)")
+    # Make the greedy senior substitutions real: write each as a flight leg on the
+    # substituting senior's route, so the schedule reflects the senior filling that seat.
+    _n_subs = _write_substitutions(_merged_routes, subs, _combined_flights)
+    if _n_subs:
+        print(f"  wrote {_n_subs} senior substitution leg(s) into senior routes")
     combined = {
         "meta": {
-            # Carry through the senior layer's v5 meta (horizon_end, days, solve_status,
+            # Carry through the senior layer's solver meta (horizon_end, days, solve_status,
             # costs, …) so the visualiser/validator have everything they expect, then
             # overlay the two-layer-specific fields.
             **L1.get("meta", {}),
@@ -332,7 +421,7 @@ if __name__ == "__main__":
     # test a short slice.
     days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
 
-    # List airlines (most flights first) and let the user choose, exactly like v5's main.
+    # List airlines (most flights first) and let the user choose, exactly like crew_solver's main.
     with open(path, encoding="utf-8") as _f:
         _counts = _Counter(row["OP_CARRIER"].strip()
                            for row in _csv.DictReader(_f)
@@ -358,12 +447,10 @@ if __name__ == "__main__":
           f"coverage={days}d (all windows)")
     solve_two_layer(path, days, airline)
 
-# ── NEXT STEP: senior substitution ────────────────────────────────────────────
-# A senior may fill a normal seat ONLY inside an idle gap of its layer-1 schedule
-# (not on rest/home-break, and able to return legal for its next senior duty). To add
-# it without breaking reconstruction: in layer 2, add each senior as its own commodity
-# whose source = its parked position at a gap start and sink = its next layer-1 duty
-# start, time-windowed to the gap, routed through the layer-2 graph so the fill leg +
-# return is clock-legal by construction. The senior commodity then contributes to the
-# (min_crew-1) coverage alongside normals. This is a self-contained insertion into the
-# fixed senior timeline — see the design discussion — and is the next increment.
+# ── POSSIBLE EXTENSION: flow-based senior substitution ─────────────────────────
+# The greedy substitution above is a heuristic post-pass. An exact version would add
+# each senior as its own commodity in layer 2: source = its parked position at a gap
+# start, sink = its next layer-1 duty, time-windowed to the gap and routed through the
+# layer-2 graph so the fill plus return is clock-legal by construction, contributing to
+# the (min_crew-1) coverage alongside normals. That optimises substitution jointly with
+# the normal fill instead of after it, at the cost of a larger model.

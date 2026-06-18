@@ -1,29 +1,8 @@
 """
-Cabin Crew Pairing via Dynamic Discretisation Discovery (DDD)
-=============================================================
-Implements the formulation from slides_copy_2.pdf exactly.
+Cabin Crew Pairing via a Time-Expanded Crew-Flow Network
+========================================================
 
-Key additions vs original:
-  - Per-airline planning: flights split by OP_CARRIER; solver runs independently
-    for each airline (separate crew pools, networks, and models).
-  - Rolling horizon: windows W of length T_days=7 with T_commit=3 committed days
-    and T_tail=7 return tail; carry-over of crew positions and clock states.
-    Each window's depot is at t=win.t_start (not always 0) so the network truly
-    rolls forward — no crew teleport back to minute 0 between windows.
-  - No-teleport crew continuity: carry_positions are unpacked into per-crew start
-    airports so a crew member who ended window w at airport K starts window w+1
-    at K, not at their home base.  Flow balance sources/sinks are set accordingly.
-  - Reachability pruning: Fwd/Bwd Dijkstra from depot/horizon, arcs violating
-    d_work or d_away excluded.
-  - Turnaround snapping: arrival end of flight arc snapped to earliest node at
-    dest satisfying the MIN_TURNAROUND gap (slide 17).
-  - Home-break clocks: per-crew state (t_reset, d_work, h_home) carried forward
-    across windows (slide 23).
-  - Bases: every airport with flights both TO and FROM in the chosen airline
-    is a full crew base; there is no separate satellite class.
-  - Cost constants aligned with slide 10 exactly.
-
-Sets & notation (slide 8–12):
+Sets & notation:
   A      All airports
   B ⊆ A  Crew home bases (= every airport with flights to & from)
   C      Crew members
@@ -32,7 +11,7 @@ Sets & notation (slide 8–12):
   F_cov  Flights requiring coverage (planning period only)
   W      Ordered solve windows (rolling horizon)
 
-Parameters (slides 9–11):
+Parameters:
   δ_f    Flight duration (minutes)
   dist_f Great-circle distance
   l_f    Passenger load factor ∈ [0,1]
@@ -48,12 +27,12 @@ Parameters (slides 9–11):
   Δ_rest = 8 h        (minimum rest before next duty)
   Δ_duty = 14 h       (maximum on-duty time per day)
   Δ_hb   = 48 h       (minimum home break)
-  d_work = 5 days     (max consecutive duty days)
-  d_away = 7 days     (return window)
+  d_work = 3 days     (max consecutive duty days)
+  d_away = 4 days     (return window / away cap)
   T_days = 7 days     (solve window length)
   T_commit = 3 days   (committed per step)
-  T_tail = 7 days     (return tail)
-  Δ_bucket = 15 min   (initial DDD time-bucket)
+  T_tail = 4 days     (return tail = d_away)
+  Δ_bucket = 15 min   (node-snap tolerance)
 """
 
 from __future__ import annotations
@@ -73,10 +52,10 @@ import gurobipy as gp
 from gurobipy import GRB
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARAMETERS  (aligned with slides 9–11)
+# PARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Duty / rest limits (slide 11)
+# Duty / rest limits
 DELTA_TA    = 45      # min turnaround between flights at same airport (min)
 DELTA_REST  = 8 * 60  # min rest before next duty (min) = 480
 DELTA_DUTY  = 14 * 60 # max on-duty time per day (min) = 840
@@ -100,21 +79,21 @@ SINK_EXPIRY       = (10 ** 15)
 # DELTA_AWAY) = 8640, and _bucket_day(0) = 0, so the value never collides.
 BREAK_IN_PROGRESS = 0
 
-# Rolling horizon (slide 20)
+# Rolling horizon
 T_DAYS_SOLVE   = 7    # solve window length in days
 T_DAYS_COMMIT  = 3    # days committed per step
 T_DAYS_TAIL    = D_AWAY    # return tail days
 T_LOOKAHEAD    = T_DAYS_SOLVE - T_DAYS_COMMIT  # = 4 days overlap
 
-# Crew limits (slide 9)
+# Crew limits
 S_MIN = 3             # minimum crew at any base 3
 
 RANDOM_SEED = 42069
 
-# Crew base assignment (slide 12)
+# Crew base assignment
 MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MIN)
 
-# Crew utilisation discount for tau_duty (slide 12 denominator).
+# Crew utilisation discount for tau_duty (denominator).
 # The raw formula tau = 8h * horizon_days assumes each crew works 8h every day,
 # but home-break (48h), consecutive-day limits (D_WORK=3), and turnaround rest
 # (DELTA_REST=8h) mean realistic utilisation is ~55% of theoretical maximum.
@@ -122,13 +101,13 @@ MIN_CREW_PER_BASE = S_MIN              # minimum crew at any base (alias of S_MI
 # needs ~60-70 to satisfy concurrent demand with legal rest intervals.
 CREW_UTILISATION = 0.55
 
-# Cost parameters (slide 10)
+# Cost parameters
 C_FL  = 100.0         # per minute of flight time worked
 C_WT  = 0.5           # per minute of wait
 C_OV  = 500.0         # flat penalty per overnight stay (wait ≥ 4 h)
-C_UNC = 107.0         # penalty per uncovered crew slot (slide 10 raw value)
 
-
+# Penalty per uncovered (committed) crew slot, large enough that the solver never
+# trades a committed cover for routing cost.
 C_UNC_EFFECTIVE = 10**8
 
 # ── Soft look-ahead (seam) coverage ───────────────────────────────────────────
@@ -149,7 +128,7 @@ C_UNC_LOOKAHEAD = 10**6        # soft penalty per look-ahead (seam) coverage slo
 T_LOOKAHEAD_COVER = 12 * 60    # minutes past t_commit to softly cover (half a day)
 
 
-# DDD solver (slide 11)
+# Time discretisation
 DELTA_BUCKET = 15     # node-snap tolerance (min); constructor default for time_bucket
 
 # Opportunity cost model
@@ -204,6 +183,16 @@ class Node:
                                    # home break must complete. NO_STATE = base graph
                                    # (un-expanded); SINK_EXPIRY = collapsed horizon.
 
+    def __post_init__(self):
+        # Cache the hash: the fields are frozen, so it never changes, and these nodes
+        # are hashed hundreds of millions of times as dict/set keys during graph build,
+        # reachability and break-clock expansion. The default frozen-dataclass __hash__
+        # recomputes hash((airport, time, break_expiry)) on every call.
+        object.__setattr__(self, "_hash", hash((self.airport, self.time, self.break_expiry)))
+
+    def __hash__(self):
+        return self._hash
+
     def __lt__(self, other):
         return (self.time, self.airport) < (other.time, other.airport)
 
@@ -229,7 +218,7 @@ class Arc:
         return isinstance(other, Arc) and self.id == other.id
 
 
-# Clock state per crew (slide 23)
+# Clock state per crew
 @dataclass
 class ClockState:
     t_reset: int            = 0      # last reset time (min from week start)
@@ -371,7 +360,7 @@ def parse_flights_by_airline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CREW BASE SIZING  (slide 12)
+# CREW BASE SIZING
 # n_p = max(n_min, ceil( (Σ_{f: f.orig=p} m_f * d_f / τ_duty) * 1.8 + noise ))
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -388,9 +377,9 @@ def assign_crew_bases(
     crew base.
 
     Per-base crew count:
-        n = max(S_MIN, min(S_MAX, ceil(max(n_demand, n_peak) * 1.8) + noise))
-      n_demand = (Sum_{f: orig=p} m_f * d_f) / tau_duty   (duration-weighted demand)
-      n_peak   = max simultaneous crew load over the horizon (peak concurrent)
+        n_demand = ceil(1.8 * (Sum_{f: orig=p} m_f * d_f) / tau_duty)  (duration-weighted)
+        n_peak   = ceil(1.8 * peak concurrent crew load over the horizon)
+        n        = max(n_demand, n_peak, MIN_CREW_PER_BASE), then a 10% Gaussian jitter
       tau_duty = 8h/day * horizon_days * CREW_UTILISATION
     """
     rng = random.Random(seed)
@@ -400,7 +389,7 @@ def assign_crew_bases(
     # A base is any airport with flights both to AND from it in this airline.
     bases = sorted(origins & dests)
 
-    # Demand:  Sum_{f: orig=p} m_f * d_f   (slide 12 numerator)
+    # Demand:  Sum_{f: orig=p} m_f * d_f   (numerator)
     demand_minutes: dict[str, float] = defaultdict(float)
     for f in flights:
         demand_minutes[f.origin] += f.min_crew * f.duration
@@ -466,7 +455,7 @@ size_crew_bases = assign_crew_bases
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPPORTUNITY COST MODEL  (slide 10: c_dh = 20/min + opp_cost)
+# OPPORTUNITY COST MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _opp_cost_scale(lf: float) -> float:
@@ -478,7 +467,7 @@ def _opp_cost_scale(lf: float) -> float:
 
 
 def deadhead_cost(f: Flight, home_base: str = "") -> float:
-    """c_dh^a for deadhead arc on flight f (slide 10).
+    """c_dh^a for deadhead arc on flight f.
 
     Deadhead costs crew salary (same as flying) plus the seat fare (displacing
     a paying passenger), making it strictly more expensive than working the same
@@ -499,7 +488,7 @@ def deadhead_cost(f: Flight, home_base: str = "") -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROLLING HORIZON WINDOWS  (slide 20)
+# ROLLING HORIZON WINDOWS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -512,7 +501,6 @@ class Window:
 
 def build_windows(total_days: int) -> list[Window]:
     """
-    Slide 20:
       t_start_w = (w-1) * T_commit * 1440
       t_commit_w = t_start_w + T_commit * 1440
       t_hor_w   = t_start_w + (T_solve + T_tail) * 1440
@@ -534,7 +522,6 @@ def slice_flights(
     flights: list[Flight], win: Window
 ) -> tuple[list[Flight], list[Flight], list[Flight]]:
     """
-    Slide 21:
       F_w      = {f : t_start ≤ dep_f < t_hor}
       F_cov_w  = {f : dep_f < t_commit}                         (hard coverage)
       F_look_w = {f : t_commit ≤ dep_f < t_commit + T_LOOKAHEAD_COVER}  (soft, seam)
@@ -552,7 +539,7 @@ def slice_flights(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REACHABILITY PRUNING  (slides 18–19)
+# REACHABILITY PRUNING
 # Fwd/Bwd Dijkstra on the time-expanded graph; arcs violating d_work or d_away
 # are excluded.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,7 +556,7 @@ def compute_reachable(
     init_t_last_home: int = -1,
 ) -> set[Node]:
     """
-    R_b^w = Fwd_b(G_w) ∩ Bwd_b(G_w)  (slide 18).
+    R_b^w = Fwd_b(G_w) ∩ Bwd_b(G_w).
     Fwd: Dijkstra from depot nodes.
     Bwd: Dijkstra backwards from horizon nodes.
     Clock state (d_work, t_since_home) tracked; arcs that violate limits pruned.
@@ -593,12 +580,8 @@ def compute_reachable(
         # State: (cost, d_work_DAYS, t_last_home, last_fly_day, node)
         #   d_work_DAYS  : consecutive DUTY DAYS since the last home touch
         #   last_fly_day : calendar day (//1440) of the most recent flight, or -1
-        # FIX: d_work counts DUTY DAYS, not flight legs.  Several flights on the
-        # same calendar day are ONE duty day (this matches compute_carry_over,
-        # which counts distinct departure days).  The previous version did
-        # `new_dw = dw + 1` per flight arc, so a regional crew flying 3-4 short
-        # legs in a single day hit D_WORK within that one day and had the rest of
-        # its day (and onward connections) pruned -- a major source of stranding.
+        # d_work counts distinct duty DAYS, not flight legs: several legs on the same
+        # calendar day are one duty day (matching compute_carry_over).
         pq = []
         for s in sources:
             dist[s] = 0.0
@@ -642,20 +625,10 @@ def compute_reachable(
                 if new_dw > D_WORK:
                     continue
 
-                # d_away: time since last home touch must not exceed DELTA_AWAY.
-                #
-                # FIX (stranding away from base): the old prune dropped EVERY
-                # flight/deadhead arc once time_away exceeded the cap — including the
-                # arc that would carry the crew HOME.  A crew that drifted even one
-                # leg over the limit therefore had no legal move and was parked at a
-                # spoke for days (e.g. 10.5d at MLI), which both wastes the crew and
-                # shows up as a d_away violation that never resolves until a later
-                # window happens to open a path.
-                #
-                # We now keep any arc whose destination IS the home base reachable
-                # regardless of time_away, so a crew is ALWAYS able to route home
-                # (arriving at most one leg late).  Arcs that travel further away are
-                # still pruned, which bounds the overage to a single home-bound leg.
+                # d_away: time since the last home touch must not exceed DELTA_AWAY.
+                # Home-bound arcs (destination == base) are kept regardless of time_away
+                # so a crew over the cap can always route home, arriving at most one leg
+                # late; only arcs travelling further away are pruned.
                 time_away = arc.true_end - new_tlh
                 if (arc.arc_type in ('flight', 'deadhead')
                         and time_away > DELTA_AWAY
@@ -867,24 +840,27 @@ def expand_break_clock(
 # CORE DDD NETWORK (one airline, one window)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class CrewDDDNetwork:
+class CrewNetwork:
     """
     Time-expanded network for one airline and one rolling-horizon window.
 
-    Variables (slide 25):
-      x_{c,a} ∈ [0,1]  per crew member c, arc a  (LP relaxation → MIP binary)
-      s_f ∈ [0, r_f]   coverage slack per flight f ∈ F_cov
+    Variables:
+      f_{g,a} ∈ ℤ≥0    integer crew FLOW per clock-group g, arc a (≤ |g|, the group
+                       size): how many crew of group g traverse arc a
+      s_f ∈ {0,…,r_f}  coverage slack per flight f ∈ F_cov
 
-    Objective (slide 26):
-      min Σ_c Σ_{a∈A_fl} c_fl*δ_a * x_{c,a}
-        + Σ_c Σ_{a∈A_dh} c_dh^a * x_{c,a}
-        + Σ_c Σ_{a∈A_wt} (c_wt*Δt_a + c_ov*1[Δt≥4h]) * x_{c,a}
+    Objective:
+      min Σ_g Σ_{a∈A_fl} c_fl*δ_a * f_{g,a}
+        + Σ_g Σ_{a∈A_dh} c_dh^a * f_{g,a}
+        + Σ_g Σ_{a∈A_wt} (c_wt*Δt_a + c_ov*1[Δt≥4h]) * f_{g,a}
         + Σ_{f∈F_cov} c_unc * s_f
+      where c_unc is the uncovered-slot penalty (C_UNC_EFFECTIVE for committed flights,
+      C_UNC_LOOKAHEAD for soft seam coverage).
 
-    Constraint 1' (slide 27): flow balance per crew member
-    Constraint 2' (slide 28): coverage per flight (with slack)
-    Constraint 3' (slide 29): duty + home-break enforced structurally (no MIP constr)
-    Constraint 4' (slide 30): x ∈ [0,1], s ∈ ℤ≥0
+    Constraint 1': flow balance per clock-group
+    Constraint 2': coverage per flight (equality, Σ_g f_{g,a_f} + s_f = r_f)
+    Constraint 3': duty + home-break enforced structurally (no MIP constraint)
+    Constraint 4': f_{g,a} ∈ ℤ≥0, s_f ∈ ℤ≥0
     """
 
     def __init__(
@@ -915,7 +891,7 @@ class CrewDDDNetwork:
         self.time_bucket = time_bucket
         self.verbose    = verbose
 
-        # Carry-over from previous window (slide 22–23)
+        # Carry-over from previous window
         self.carry_positions: dict[str, dict[str, int]] = carry_positions or {}
         self.carry_clocks: dict[int, ClockState] = carry_clocks or {}
 
@@ -1017,7 +993,7 @@ class CrewDDDNetwork:
 
     def _snap_arrival(self, airport: str, true_arr: int) -> Optional[Node]:
         """
-        Slide 17: snap arrival end of flight arc to earliest existing node at dest
+        snap arrival end of flight arc to earliest existing node at dest
         satisfying the turnaround gap:
           t' = min{t' ∈ T_ap : t' >= true_arr + Δ_ta}
 
@@ -1026,7 +1002,7 @@ class CrewDDDNetwork:
         The arc ends at t', not at true_arr. true_arr is stored separately as
         arc.true_end for violation detection in the DDD loop.
 
-        Depot departures (t=0) are exempt per slide 17.
+        Depot departures (t=0) are exempt.
         """
         return self._find_node_at_or_after(airport, true_arr + DELTA_TA)
 
@@ -1049,7 +1025,7 @@ class CrewDDDNetwork:
               f"hor={self.win.t_hor//1440}d)...")
         t0 = _t.time()
 
-        # 1. Depot (t=depot_start) and horizon nodes (slide 14).
+        # 1. Depot (t=depot_start) and horizon nodes.
         #    Use self.depot_start = win.t_start so the depot rolls with the window.
         #    Each crew member gets a depot node at their actual start airport
         #    (which may differ from home base if carry-over places them elsewhere).
@@ -1061,7 +1037,7 @@ class CrewDDDNetwork:
             self._add_node_sorted(Node(ap, self.depot_start))
             self._add_node_sorted(Node(ap, self.horizon_end))
 
-        # 2. Insert event nodes for every flight (slide 14).
+        # 2. Insert event nodes for every flight.
         #    Origin gets a departure-time node so flight arcs can depart from it.
         #    Destination gets an arrival-time node so _snap_arrival has something
         #    to snap to — it searches for the first node at dest with
@@ -1089,7 +1065,7 @@ class CrewDDDNetwork:
         if self.verbose:
             print(f"    Nodes after dep/arr: {len(self.nodes)}  ({_t.time()-t0:.1f}s)")
 
-        # 3. Wait arcs: chain consecutive nodes at each airport (slide 15).
+        # 3. Wait arcs: chain consecutive nodes at each airport.
         #    Every airport's timeline now ends at its horizon node (for bases)
         #    so wait arcs fully connect each node to the horizon.
         base_airports_set = set(c.base for c in self.crew)
@@ -1108,8 +1084,8 @@ class CrewDDDNetwork:
             if depot_node in self.nodes:
                 self.min_duty_at[depot_node] = 0
 
-        # 5. Flight + deadhead arcs (slides 15–16)
-        #    Arrival end is snapped to satisfy Δ_ta (slide 17).
+        # 5. Flight + deadhead arcs
+        #    Arrival end is snapped to satisfy Δ_ta.
         n_arcs = 0
         n_missing = 0
         n_duty_pruned = 0
@@ -1119,13 +1095,13 @@ class CrewDDDNetwork:
                 n_missing += 1
                 continue
 
-            # Snap arrival (slide 17)
+            # Snap arrival
             arr_node = self._snap_arrival(f.dest, f.arr_min)
             if arr_node is None or arr_node.time > self.horizon_end:
                 n_missing += 1
                 continue
 
-            # Duty-time check (slide 11 / Constraint 3')
+            # Duty-time check (Constraint 3')
             duty_at_dep = self.min_duty_at.get(dep_node, 0)
             duty_after  = duty_at_dep + f.duration
             if duty_after > DELTA_DUTY:
@@ -1137,10 +1113,10 @@ class CrewDDDNetwork:
             if duty_after < existing:
                 self.min_duty_at[arr_node] = duty_after
 
-            # Flight arc: cost = c_fl * δ_f  (slide 15)
+            # Flight arc: cost = c_fl * δ_f
             self._make_arc(dep_node, arr_node, f.arr_min,
                            f.duration * C_FL, 'flight', f.id)
-            # Deadhead arc: cost = c_dh^a  (slide 16)
+            # Deadhead arc: cost = c_dh^a
             self._make_arc(dep_node, arr_node, f.arr_min,
                            deadhead_cost(f), 'deadhead', f.id)
             n_arcs += 2
@@ -1165,7 +1141,7 @@ class CrewDDDNetwork:
             cost = dt * C_WT + overnight * C_OV
         arc = self._make_arc(frm, to, to.time, cost, 'wait')
         self.wait_arc_by_start[frm] = arc
-        # Rest resets duty (slide 29: wait ≥ Δ_rest resets duty clock)
+        # Rest resets duty (wait ≥ Δ_rest resets duty clock)
         if dt >= DELTA_REST:
             self.min_duty_at[to] = 0
         return arc
@@ -1243,22 +1219,12 @@ class CrewDDDNetwork:
 
     def _compute_base_reachability(self):
         """
-        Compute reachable arc sets, one per distinct crew CLOCK-GROUP rather than
-        one per base.
-
-        FIX (stranding): the previous version computed a single reachable set per
-        base using the WORST-CASE d_work across all crew at that base
-        (max_dwork = max over C_b).  That poisoned fresh, home-based crew with a
-        stranded member's carry-over clock: a base with even one crew at
-        d_work = D_WORK had its entire reachable arc set pruned as if every crew
-        were maxed out, so the fresh crew could not be deployed and silently
-        dropped out of every later window.
-
-        Now each crew member's reachability is computed from THEIR OWN start
-        airport and carry-over clock (init_dwork, init_t_last_home).  Crew sharing
-        an identical (base, start_airport, init_dwork, init_t_last_home) signature
-        share a single Dijkstra, so the call count stays close to |B| in the
-        common case (most crew start at home with a zero clock).
+        Compute reachable arc sets per crew member, from each crew's OWN start airport
+        and carry-over clock (init_dwork, init_t_last_home) rather than a worst-case
+        clock shared across a base. Crew sharing an identical
+        (base, start_airport, init_dwork, init_t_last_home) signature share a single
+        Dijkstra, so the call count stays close to |B| in the common case (most crew
+        start at home with a zero clock).
 
         self._base_reachable_arcs is now keyed by CREW ID (not base).
         """
@@ -1386,7 +1352,7 @@ class CrewDDDNetwork:
             print(f"    Break-clock expansion (v4 shared): {total_exp_arcs:,} expanded arcs "
                   f"across {n_groups} groups  ({_t.time()-t0:.1f}s)")
 
-    # ── Gurobi model (Constraints 1'–4', slides 27–30) ───────────────────────
+    # ── Gurobi model (Constraints 1'–4') ───────────────────────
 
     def build_model(self):
         import time as _t
@@ -1505,7 +1471,7 @@ class CrewDDDNetwork:
                 total_vars += 1
             self.group_flow[gkey] = fv
 
-        # ── Slack variables s_f (slide 25) ───────────────────────────────────
+        # ── Slack variables s_f ───────────────────────────────────
         # Hard coverage (commit region): full uncovered penalty.
         for f in self.cov_flights:
             sv = self.model.addVar(
@@ -1533,7 +1499,7 @@ class CrewDDDNetwork:
                   f"({len(self.active_group_keys)} groups, {len(self.lookahead_flights)} "
                   f"look-ahead)  ({_t.time()-t0:.1f}s)")
 
-        # ── Constraint 1': Flow balance, per clock-group (slide 27, v4) ────────
+        # ── Constraint 1': Flow balance, per clock-group  ────────
         # Each group g with K_g crew: K_g units leave its depot state and K_g are
         # absorbed at its SINK_EXPIRY horizon state; flow is conserved everywhere else.
         for gkey in self.active_group_keys:
@@ -1566,7 +1532,7 @@ class CrewDDDNetwork:
         if self.verbose:
             print(f"    Flow balance constraints added (per group)  ({_t.time()-t0:.1f}s)")
 
-        # ── Constraint 2': Coverage (slide 28) ───────────────────────────────
+        # ── Constraint 2': Coverage ───────────────────────────────
         # Coverage is an EQUALITY: Σ flight-arc flow + slack = r_f, with slack in
         # [0, r_f]. The slack absorbs any shortfall (penalised), and the equality also
         # caps the operator count at r_f — so the flow can no longer OVER-cover a flight
@@ -1743,12 +1709,12 @@ class CrewDDDNetwork:
             self.flow_constrs[crew_id] = {}
         self.flow_constrs[crew_id][node] = constr
 
-    # ── DDD Solve loop (slides 31–32) ─────────────────────────────────────────
+    # ── Solve loop ─────────────────────────────────────────
 
     def make_integer(self):
-        """Constraint 4' (slide 30): make crew-flow integral.
+        """Constraint 4': make crew-flow integral.
 
-        v5: group-flow variables are general INTEGER. A flight arc may carry up to
+        Group-flow variables are general INTEGER. A flight arc may carry up to
         min_crew(f) crew of one group (the flight needs r_f working crew, not 1), and a
         deadhead arc may carry several. Decomposition splits each unit into its own
         path, so a flight worked by 4 crew yields 4 paths through that flight arc."""
@@ -1774,7 +1740,7 @@ class CrewDDDNetwork:
         """
         print(f"\n  === Solve (window {self.win.idx}) ===")
 
-        # MIP phase (slide 32): flip arc vars to binary and solve once.
+        # MIP phase: flip flow vars to integer and solve once.
         self.make_integer()
         # Each slack carries its own penalty in .Obj (C_UNC_EFFECTIVE for committed
         # coverage, C_UNC_LOOKAHEAD for soft seam coverage), so read it per-variable
@@ -1826,7 +1792,7 @@ class CrewDDDNetwork:
 
         return self.extract_solution()
 
-    # ── Solution extraction (slides 33–34) ────────────────────────────────────
+    # ── Solution extraction ────────────────────────────────────
 
     def _decompose_flows(self) -> dict[int, list[Arc]]:
         """Decompose each group's integer crew-flow into one depot→sink path per crew.
@@ -1927,7 +1893,7 @@ class CrewDDDNetwork:
 
     def _extract_routes(self, crew_active: dict[int, list[Arc]]) -> list[dict]:
         """
-        Slide 33: Route(c) = {ℓ ∈ A*_c | ℓ.type ≠ wait}
+        Route(c) = {ℓ ∈ A*_c | ℓ.type ≠ wait}
         Preference: flight > deadhead > wait.
         """
         routes = []
@@ -1980,17 +1946,17 @@ class CrewDDDNetwork:
 
         return routes
 
-    # ── Carry-over (slides 22–23) ──────────────────────────────────────────────
+    # ── Carry-over ──────────────────────────────────────────────
 
     def compute_carry_over(self) -> tuple[dict[str, dict[str, int]], dict[int, ClockState], dict[int, str]]:
         """
-        Slide 22: position n_{b,k}^{w+1} = |{c ∈ C_b : loc_w(c) = k}|
-        Slide 23: worst-case clock state Γ^{w+1}_c = argmax_{c ∈ C_b} d_work_c
+        position n_{b,k}^{w+1} = |{c ∈ C_b : loc_w(c) = k}|
+        worst-case clock state Γ^{w+1}_c = argmax_{c ∈ C_b} d_work_c
         Falls back to home-base positions if no solution is available.
 
         Returns a third element: crew_pos — the per-crew-id airport map used to
         build `positions`.  The caller passes this directly into the next window's
-        CrewDDDNetwork.__init__ as `carry_crew_pos` so crew_start_airport is
+        CrewNetwork.__init__ as `carry_crew_pos` so crew_start_airport is
         assigned deterministically by crew ID rather than by queue order within a
         base.  This eliminates the teleportation bug where two crew from the same
         base end up at different airports and then get their positions swapped by
@@ -2122,12 +2088,12 @@ class CrewDDDNetwork:
                 break_in_progress=bip,
             )
 
-        # n_{b,k}^{w+1} (slide 22)
+        # n_{b,k}^{w+1}
         positions: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for c in self.crew:
             positions[c.base][crew_pos[c.id]] += 1
 
-        # Worst-case clock per crew (slide 23): argmax d_work, tiebreak by t_reset then h_home
+        # Worst-case clock per crew: argmax d_work, tiebreak by t_reset then h_home
         worst_clocks: dict[int, ClockState] = {}
         for c in self.crew:
             # In individual model each crew member has their own clock; just carry it forward
@@ -2141,7 +2107,7 @@ def derive_home_breaks(base: str, legs: list[dict]) -> list[dict]:
 
     The MILP enforces home breaks structurally (expanded-graph reset) but never
     writes the window out, so the viz was left guessing and getting it wrong.
-    This mirrors the solver's clocks (slide 23) so the export carries the truth:
+    This mirrors the solver's clocks so the export carries the truth:
 
       * d_work = consecutive DUTY DAYS in the current away-from-base spell.
         Counts distinct flight calendar-days (several legs in one day = one day,
@@ -2381,7 +2347,7 @@ def solve_airline(
     print(f"AIRLINE: {airline}  |  {len(flights)} flights  |  coverage={coverage_days}d")
     print(f"{'='*70}")
 
-    # Build windows across the coverage period (slide 20).
+    # Build windows across the coverage period.
     # If coverage_days < T_DAYS_COMMIT we still run at least one window.
     effective_days = max(coverage_days, T_DAYS_COMMIT)
     windows = build_windows(effective_days)
@@ -2422,7 +2388,7 @@ def solve_airline(
               f"{len(f_look)} seam look-ahead  "
               f"[t={win.t_start//1440}d – commit={win.t_commit//1440}d – hor={win.t_hor//1440}d]")
 
-        net = CrewDDDNetwork(
+        net = CrewNetwork(
             flights=f_win,
             cov_flights=f_cov,
             crew=crew,
@@ -2438,7 +2404,7 @@ def solve_airline(
         net.build_model()
         result = net.solve()
 
-        # Carry-over for next window (slides 22–23)
+        # Carry-over for next window
         # Fix 2: unpack the third return value (per-crew-id airport map)
         carry_positions, carry_clocks, carry_crew_pos = net.compute_carry_over()
 
