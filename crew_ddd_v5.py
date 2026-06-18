@@ -843,6 +843,18 @@ def expand_break_clock(
 
     state_nodes = {n for n in state_nodes if n in alive}
     state_arcs = [a for a in state_arcs if a.start in alive and a.end in alive]
+    # Deterministic ordering. The expansion above visits states in set-iteration order
+    # (which varies run-to-run with PYTHONHASHSEED), so state_arcs — and hence the
+    # Gurobi variable column order built from it downstream — would otherwise differ
+    # every run, swinging the solve time via degenerate-pivot luck. Sort by node/arc
+    # VALUE so every run hands Gurobi a byte-identical model. Pure reordering: Arc is
+    # keyed by id in the var dicts, so this changes nothing but the column order.
+    state_arcs.sort(key=lambda a: (
+        a.start.time, a.start.airport, a.start.break_expiry,
+        a.end.time, a.end.airport, a.end.break_expiry,
+        a.arc_type, a.flight_id if a.flight_id is not None else -1,
+        a.true_end, a.cost,
+    ))
     arcs_from: dict[Node, list[Arc]] = defaultdict(list)
     arcs_to = defaultdict(list)
     for a in state_arcs:
@@ -1533,7 +1545,8 @@ class CrewDDDNetwork:
             exp_from = grp["e_from"]
             exp_to   = grp["e_to"]
             fc: dict[Node, gp.Constr] = {}
-            for node in grp["e_nodes"]:
+            for node in sorted(grp["e_nodes"],
+                               key=lambda n: (n.time, n.airport, n.break_expiry)):
                 out_arcs = exp_from.get(node, [])
                 in_arcs  = exp_to.get(node, [])
                 if not out_arcs and not in_arcs:
@@ -1554,10 +1567,15 @@ class CrewDDDNetwork:
             print(f"    Flow balance constraints added (per group)  ({_t.time()-t0:.1f}s)")
 
         # ── Constraint 2': Coverage (slide 28) ───────────────────────────────
-        # Always add the constraint even when fl_arcs is empty.
-        # When empty: slack_var >= min_crew forces the full uncoverage penalty.
-        # Old code had `if not fl_arcs: continue` which left the slack
-        # unconstrained so Gurobi set it to 0 for free — flight looked covered.
+        # Coverage is an EQUALITY: Σ flight-arc flow + slack = r_f, with slack in
+        # [0, r_f]. The slack absorbs any shortfall (penalised), and the equality also
+        # caps the operator count at r_f — so the flow can no longer OVER-cover a flight
+        # by routing surplus crew through it to reposition (which used to happen because
+        # deadheading, priced c_fl + fare, is dearer than operating). Excess positioning
+        # crew now reroute onto the deadhead arc for the same flight (which exists for
+        # every flight and does NOT count toward coverage), so the model stays feasible
+        # and each flight is operated by exactly its requirement (or fewer, with slack).
+        # Always add the constraint even when fl_arcs is empty (then slack = r_f).
         # Build expanded flight-arc index: flight_id -> [(group_key, arc), ...].
         # Coverage = total crew FLOW on the flight's arcs across all groups.
         _exp_fl: dict[int, list[tuple[tuple, Arc]]] = defaultdict(list)
@@ -1575,7 +1593,7 @@ class CrewDDDNetwork:
                 cov_expr = 0.0
                 n_no_arcs += 1
             constr = self.model.addConstr(
-                cov_expr + self.slack_var[f.id] >= f.min_crew,
+                cov_expr + self.slack_var[f.id] == f.min_crew,
                 name=f"cov_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
@@ -1587,7 +1605,7 @@ class CrewDDDNetwork:
             pairs = _exp_fl.get(f.id, [])
             cov_expr = gp.quicksum(self.group_flow[gk][arc] for gk, arc in pairs) if pairs else 0.0
             constr = self.model.addConstr(
-                cov_expr + self.slack_var[f.id] >= f.min_crew,
+                cov_expr + self.slack_var[f.id] == f.min_crew,
                 name=f"cov_look_{f.id}",
             )
             self.coverage_constrs[f.id] = constr
@@ -1777,9 +1795,34 @@ class CrewDDDNetwork:
         # CREW_METHOD env overrides (-1 auto/simplex-concurrent, 2 barrier).
         self.model.setParam("Method", 2)
         self.model.setParam("Crossover", 0)
-        # self.model.setParam("MIPFocus", 1)        # prioritise finding good incumbents
-        # self.model.setParam("NoRelHeurTime", 30)  # 30s heuristic pass before LP
-        self.model.optimize()
+        # Adaptive crossover (opt-in via CREW_PROBE=<seconds>; default OFF = original
+        # single Crossover=0 solve). Unit-demand models (senior layer, single-crew
+        # airlines) and most multi-crew windows solve at the ROOT with no basis, so
+        # Crossover=0 is fastest and forcing crossover just taxes them. But a few hard
+        # multi-crew windows get stuck while BRANCHING — with no warm-start basis each
+        # node LP is re-solved almost from scratch (~33k pivots/node). So: probe with
+        # Crossover=0 up to PROBE seconds; if it times out still far from optimal (i.e.
+        # it IS branching but crawling), reset, switch crossover on for a warm-startable
+        # basis + focus on incumbents, and re-solve with the full limit. (A window that
+        # is stuck in ROOT cut-gen rather than branching — the 3M-var case — won't be
+        # rescued by this; that needs a smaller model.)
+        probe = int(os.environ.get("CREW_PROBE", "0"))
+        if probe > 0:
+            self.model.setParam("TimeLimit", probe)
+            self.model.optimize()
+            stuck = (self.model.Status == GRB.TIME_LIMIT
+                     and (self.model.SolCount == 0 or self.model.MIPGap > 0.05))
+            if stuck:
+                gap = self.model.MIPGap if self.model.SolCount > 0 else float('inf')
+                print(f"    [CREW_PROBE] still stuck after {probe}s (gap={gap:.1%}, "
+                      f"nodes={int(self.model.NodeCount)}); switching crossover ON, re-solving")
+                self.model.reset()
+                self.model.setParam("Crossover", -1)
+                self.model.setParam("MIPFocus", 1)
+                self.model.setParam("TimeLimit", 1800)
+                self.model.optimize()
+        else:
+            self.model.optimize()
 
         return self.extract_solution()
 

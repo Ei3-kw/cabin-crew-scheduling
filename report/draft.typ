@@ -55,6 +55,9 @@ A planning period of 30 days is used, extended by a return tail to a 34-day hori
 === Rolling Horizon
 ==== Seaming
 ==== Window Carry-over
+
+At each seam the next window starts from the committed state of the previous one. Two things carry across: each crew's committed end position -- the airport it occupies when the committed region closes -- and its break-clock state. The clock is summarised by a single anchor, the minute the crew last left home after a completed home break, from which the away budget keeps counting. The subtlety is what counts as a completed break: only a 48-hour home stay whose full 48 hours elapse inside the committed region advances the anchor. A break the solver schedules in the uncommitted tail is deliberately not credited, because the tail is re-planned by the next window and that break may never actually be flown. A crew that is home at the seam but has served only part of its break carries the start of that home stay forward, so the next window finishes the remaining hours rather than restarting a fresh 48 -- this neither forces an early return nor grants a free reset.
+
 === Crew-Flow Model
 ==== Break-Clock Expansion
 // clock state (away budget / home break) is a node dimension; an illegal transition
@@ -93,33 +96,55 @@ A planning period of 30 days is used, extended by a return tail to a 34-day hori
 === Solve Method
 ==== Barrier vs Simplex
 
+The per-window relaxation is large and sparse, so it is solved by the barrier (interior-point) method rather than simplex, which otherwise spent the whole time limit pivoting at the root. For the unit-demand models -- the senior layer, or any single-crew airline -- the group-flow relaxation is integral, so the barrier lands directly on an integer optimum, branch-and-bound never fires, and crossover to a simplex basis is pure overhead and is switched off. This is the regime the method is built for, and such windows solve in well under a minute. Once a flight needs more than one crew the coverage constraints couple flow across groups and break that integrality, so the root relaxation is fractional and the model must branch, with the consequences taken up in the results.
+
+==== Deterministic Model Construction
+
+The expanded graph is built by exploring states held in hash sets, whose iteration order depends on the process hash seed. Identical inputs therefore produced models with their variables in different column orders from one run to the next, and because the crew-flow model is highly degenerate -- many interchangeable crew and equivalent paths -- the solver's anti-degeneracy effort swung sharply with that order, the same window taking anywhere from thirty seconds to over a hundred. Sorting arcs and nodes by value before they are handed to the solver makes the constructed model byte-identical across runs -- same fingerprint, same result, same time -- which removes the variance, makes timings comparable, and as a side effect presolves slightly smaller, since the regular ordering is easier to reduce.
+
 
 
 == Results
 
-=== Coverage Breakdown
-==== Fully Crewed
-==== Cancelled (No Senior)
-==== Understaffed (Normal Shortfall)
+=== G7
+==== Coverage Breakdown
+===== Fully Crewed
+===== Cancelled (No Senior)
+===== Understaffed (Normal Shortfall)
 
-=== Uncovered flights
-==== Structural Spokes (isolated, sub-45 turnaround)
-==== One-Directional Spoke Connectivity
-==== Rolling-Horizon Seam Effects
+==== Uncovered flights
+===== Structural Spokes (isolated, sub-45 turnaround)
+===== One-Directional Spoke Connectivity
+===== Rolling-Horizon Seam Effects
 
-=== Senior as the Binding Resource
+==== Senior as the Binding Resource
 
-=== Senior Substitution Outcomes
+==== Senior Substitution Outcomes
 
-=== Two-Layer Tractability
-==== Multi-Crew as Two Unit-Demand Layers
-==== Effect of Barrier on Large Windows
+==== Two-Layer Tractability
+===== Multi-Crew as Two Unit-Demand Layers
+===== Effect of Barrier on Large Windows
 
-=== Schedule Validation
-==== Rule-Compliance Checks
-==== Window-Boundary Carry-over Fix
+Solving the multi-crew requirement directly -- one model with $r_f > 1$ -- shows why the two-layer split matters. With every G7 flight needing two crew, the coverage constraints make the root relaxation fractional, so the barrier point is no longer integer and the model must branch. Most windows still resolve at the root, but the windows late in the horizon, where the return tail runs past the end of the flight data and connectivity is sparse, stall: the relaxation bound is loose -- the LP "covers" flights with fractional flow that no whole crew can realise -- and, with crossover off, each branch-and-bound node re-solves its LP without a warm-start basis, so node throughput collapses. Three of the ten windows hit the thirty-minute limit at 24 to 83 per cent gap with badly degraded coverage. The two-layer decomposition avoids this entirely: each layer is unit-demand and therefore root-integral, so every window solves quickly -- the same airline that stalls as one model runs cleanly as two layers.
+
+==== Schedule Validation
+===== Rule-Compliance Checks
+===== Window-Boundary Carry-over Fix
+
+An earlier carry-over read each crew's break deadline straight off the last committed arc of the expanded graph. Because the cost-minimising solution within a window is free to park the mandatory 48-hour break in the uncommitted tail, that arc reported a deadline as if the break had already been served, so the anchor advanced every window even though no break was ever committed. The away clock therefore reset at each seam and drifted forward, letting crew accumulate five to seven days away and double-digit consecutive duty days across the merged schedule -- on the G7 instance the independent validator flagged 352 away-cap and 341 consecutive-duty violations, none of which were visible window-by-window. Tracking the anchor on the committed legs only, exactly as the validator reconstructs it, and crediting a partly-served break across the seam, removes the drift: the same instance then validates with zero violations of any rule while senior coverage is essentially unchanged at 5001 of 5141 flights, confirming the violations were a boundary-accounting artefact rather than illegal routes the solver actually wanted.
 
 === Model Scaling Limits
+
+
+
+
+
+
+
+
+
+
+
 
 == Things Attempted but Left Out
 
@@ -127,6 +152,9 @@ A planning period of 30 days is used, extended by a return tail to a 34-day hori
 
 === Direct Multi-Crew (min_crew > 1) Solve
 ==== Barrier with Crossover Disabled
+
+Enabling crossover globally, to give branch-and-bound a warm-start basis on the fractional multi-crew windows, was a net loss. The easy windows -- which solve at the root and never branch -- paid a large crossover cost for nothing: forcing a basis on a million-variable degenerate model meant pushing hundreds of thousands of variables to a vertex (with a restart), and one window grew from about seven to twenty-two minutes for no benefit. A targeted variant was kept as an opt-in instead: probe with crossover off, and only if a window times out while still branching far from optimal, switch crossover on and re-solve with the full budget. This rescues the mid-size stalled windows without taxing the majority, but it does not help the largest window, which is stuck in root processing before branching even starts -- a model-size problem, not a missing-basis one.
+
 ==== Looser Time Limit
 
 === Mainline-Scale Airlines

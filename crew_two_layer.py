@@ -40,6 +40,8 @@ def _flight_obj_key(f):
 
 
 def solve_two_layer(csv_path, days, airline):
+    import time as _t
+    t_start = _t.time()
     fba, _ = v5.parse_flights_by_airline(csv_path, days)
     if airline not in fba:
         sys.exit(f"airline {airline} not found; have {sorted(fba)[:10]}...")
@@ -57,8 +59,10 @@ def solve_two_layer(csv_path, days, airline):
     flights_L1 = [replace(f, min_crew=1) for f in flights]
     seniors = v5.size_crew_bases(flights_L1)
     print(f"  Senior pool sized for 1-per-flight demand: {len(seniors)} seniors")
+    _t_l1 = _t.time()
     v5.solve_airline(f"{airline}_L1senior", flights_L1, days,
                      out_dir=OUT_DIR, crew_override=seniors)
+    l1_secs = _t.time() - _t_l1
     L1 = json.load(open(f"{OUT_DIR}/result_{airline}_L1senior.json"))
     cancelled_keys = {_fkey(u) for u in L1["uncovered_flights"]}
     surviving = [f for f in flights if _flight_obj_key(f) not in cancelled_keys]
@@ -73,6 +77,7 @@ def solve_two_layer(csv_path, days, airline):
     print("\n########## LAYER 2 — FILL (normal crew, min_crew-1) ##########")
     flights_L2 = [replace(f, min_crew=f.min_crew - 1)
                   for f in surviving if f.min_crew > 1]
+    _t_l2 = _t.time()
     if flights_L2:
         normals = [replace(c, id=c.id + NORMAL_ID_OFFSET)
                    for c in v5.size_crew_bases(flights_L2)]
@@ -84,8 +89,11 @@ def solve_two_layer(csv_path, days, airline):
         normals = []
         print("  No layer-2 demand (all surviving flights are min_crew=1).")
         L2 = {"routes": [], "uncovered_flights": []}
+    l2_secs = _t.time() - _t_l2
 
-    combine_and_report(airline, flights, seniors, normals, L1, L2, surviving, n_cancelled)
+    timings = {"start": t_start, "layer1": l1_secs, "layer2": l2_secs}
+    combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
+                       n_cancelled, timings=timings)
 
 
 DELTA_REST = 8 * 60     # 8h rest
@@ -145,7 +153,72 @@ def apply_substitution(flights, seniors, L1, surviving_keys, understaffed):
     return subs
 
 
-def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving, n_cancelled):
+def _remap_l2_routes(l2_routes, combined_flights):
+    """Layer 2 is solved on its OWN flight set, so its route legs carry L2-LOCAL flight
+    ids (0..|L2|-1) that collide with — but do not match — the global ids used by L1 and
+    the combined `flights` list. Without remapping, every normal/deadhead leg points at
+    the wrong flight in the viz. Re-key each leg to the global flight id by its geometry
+    (origin, dest, departure), which is stable across the two solves."""
+    gid = {(f["origin"], f["dest"], f["dep_min"]): f["id"] for f in combined_flights}
+    out = []
+    for r in l2_routes:
+        legs = []
+        for l in r["legs"]:
+            l = dict(l)
+            if l.get("flight_id") is not None:
+                l["flight_id"] = gid.get((l["from"], l["to"], l["dep"]))
+            legs.append(l)
+        rr = dict(r)
+        rr["legs"] = legs
+        out.append(rr)
+    return out
+
+
+def _flights_with_real_min_crew(l1_flights, flights):
+    """L1's serialised flights carry min_crew=1 (the senior demand). Patch each back to
+    the real total requirement from the original Flight objects, keyed by id."""
+    real = {f.id: f.min_crew for f in flights}
+    out = []
+    for ff in l1_flights:
+        ff = dict(ff)
+        if ff.get("id") in real:
+            ff["min_crew"] = real[ff["id"]]
+        out.append(ff)
+    return out
+
+
+def _cap_overstaffing(routes, combined_flights, senior_ids):
+    """Cap each flight at exactly its requirement -- 1 senior + (min_crew-1) normals
+    OPERATING -- and reclassify any surplus operators as deadheads. The surplus crew
+    still ride the flight (so routes stay continuous), they just no longer count as
+    operating it. This is what they really were: repositioning crew that the flow model
+    routes through a flight arc because operating (cost c_fl) is cheaper than a deadhead
+    seat (c_dh = c_fl + fare).
+
+    With the equality coverage constraint now enforced in the solver this is a no-op for
+    fresh runs; it remains here so the combined schedule is clean regardless of the layer
+    solves (e.g. cached pre-equality results). Mutates the leg dicts in `routes`."""
+    req = {f["id"]: f["min_crew"] for f in combined_flights}
+    ops = defaultdict(lambda: {"sr": [], "nm": []})
+    for r in routes:
+        is_sr = r["crew_id"] in senior_ids
+        for l in r["legs"]:
+            if l.get("type") == "flight" and l.get("flight_id") is not None:
+                ops[l["flight_id"]]["sr" if is_sr else "nm"].append(l)
+    n = 0
+    for fid, o in ops.items():
+        mc = req.get(fid, 1)
+        for l in o["sr"][1:]:              # keep 1 senior operating, rest deadhead
+            l["type"] = "deadhead"; n += 1
+        for l in o["nm"][max(0, mc - 1):]:  # keep (min_crew-1) normals, rest deadhead
+            l["type"] = "deadhead"; n += 1
+    return n
+
+
+def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
+                       n_cancelled, timings=None):
+    import time as _t
+    t_combine = _t.time()
     # working crew per flight: 1 senior (if surviving) + normals from L2
     # Count normals operating each flight from L2 routes (by flight_id within L2's
     # own flight set is awkward across the remap, so count by route legs' from/to/dep).
@@ -198,9 +271,34 @@ def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving, n_
     print(f"  senior routes        : {len(L1.get('routes', []))}")
     print(f"  normal routes        : {len(L2.get('routes', []))}")
 
+    runtime = None
+    if timings is not None:
+        combine_secs = _t.time() - t_combine
+        total_secs = _t.time() - timings["start"]
+        runtime = {"layer1": round(timings["layer1"], 1),
+                   "layer2": round(timings["layer2"], 1),
+                   "combine": round(combine_secs, 1),
+                   "total": round(total_secs, 1)}
+        print("  " + "-" * 52)
+        print(f"  run time -- Layer 1 (senior solve)      : {timings['layer1']:8.1f}s")
+        print(f"  run time -- Layer 2 (normal fill solve) : {timings['layer2']:8.1f}s")
+        print(f"  run time -- combine + substitution      : {combine_secs:8.1f}s")
+        print(f"  run time -- TOTAL                       : {total_secs:8.1f}s")
+
     # Write a combined result for the viz/validator: merge senior + normal routes.
+    _combined_flights = _flights_with_real_min_crew(L1.get("flights", []), flights)
+    # L1 routes already use global ids; L2 routes must be remapped to them (see above).
+    _merged_routes = L1.get("routes", []) + _remap_l2_routes(L2.get("routes", []), _combined_flights)
+    # Normalise any flow-model over-coverage: surplus operators -> deadhead.
+    _n_capped = _cap_overstaffing(_merged_routes, _combined_flights, {c.id for c in seniors})
+    if _n_capped:
+        print(f"  normalised {_n_capped} surplus operator leg(s) -> deadhead (over-coverage)")
     combined = {
         "meta": {
+            # Carry through the senior layer's v5 meta (horizon_end, days, solve_status,
+            # costs, …) so the visualiser/validator have everything they expect, then
+            # overlay the two-layer-specific fields.
+            **L1.get("meta", {}),
             "airline": airline,
             "two_layer": True,
             "n_senior": len(seniors),
@@ -209,11 +307,14 @@ def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving, n_
             "cancelled": cancelled,
             "fully_crewed": fully,
             "understaffed": understaffed,
+            "runtime_secs": runtime,
         },
         "crew": [{"id": c.id, "base": c.base,
                   "is_senior": c in set(seniors)} for c in (seniors + normals)],
-        "flights": L1.get("flights", []),
-        "routes": L1.get("routes", []) + L2.get("routes", []),
+        # The senior layer stamped every flight min_crew=1; restore the REAL total
+        # requirement (1 senior + (min_crew-1) normals) so the viz shows the right need.
+        "flights": _combined_flights,
+        "routes": _merged_routes,
         "uncovered_flights": L1.get("uncovered_flights", []),   # cancelled flights
     }
     out = f"{OUT_DIR}/result_{airline}_twolayer.json"
