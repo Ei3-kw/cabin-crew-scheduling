@@ -17,11 +17,11 @@ Parameters:
   r_f    Required working crew count
   s_b    Crew supply at base b
   s_min=3
-  c_fl   = 100 / min  (flight time worked)
+  c_fl   = 100 / min  (normal flight time worked; senior 420 — see C_FL_SENIOR)
   c_dh   = c_fl + fare (deadhead = labor + seat opp-cost, always > flight cost)
-  c_wt   = 0.5 / min  (wait cost rate)
+  c_wt   = 0.5 / min  (normal wait cost rate; senior 1.0 — see C_WT_SENIOR)
   c_ov   = 500        (overnight flat penalty, wait ≥ 4 h)
-  c_unc  = 107        (penalty per uncovered slot)
+  c_unc  = 1e8        (penalty per uncovered slot — see C_UNC_EFFECTIVE)
   Δ_ta   = 45 min     (minimum turnaround)
   Δ_rest = 8 h        (minimum rest before next duty)
   Δ_duty = 14 h       (maximum on-duty time per day)
@@ -31,7 +31,6 @@ Parameters:
   T_days = 7 days     (solve window length)
   T_commit = 3 days   (committed per step)
   T_tail = 4 days     (return tail = d_away)
-  Δ_bucket = 15 min   (node-snap tolerance)
 """
 
 from __future__ import annotations

@@ -1,0 +1,3 @@
+# Python 3.10+
+# Solver (requires a licensed Gurobi install)
+gurobipy>=11.0

@@ -18,9 +18,10 @@ Cost model (labour only, per crew member per minute):
     own home base is FREE (mandatory rest, no per-diem), exactly as the solver's
     wait arcs treat it; waiting away from base is charged the crew's wait rate.
   * This is a pure rate*minutes model: no deadhead seat-fare, no overnight flat
-    penalty, no uncovered-slot penalty. The flights in a two-layer JSON do not
-    carry distance/load-factor, so a fare-based deadhead cost is not derivable
-    from this file anyway.
+    penalty. The uncovered-slot penalty is added separately below as a flat
+    big-M, matching the solver. The flights in a two-layer JSON do not carry
+    distance/load-factor, so a fare-based deadhead cost is not derivable from
+    this file anyway.
 
 Usage:
     python3 compute_cost.py [results/result_ZW_twolayer.json]
@@ -34,13 +35,15 @@ RATE_FLY = {True: 420.0, False: 100.0}   # keyed by is_senior
 RATE_WAIT = {True: 1.0,  False: 0.5}
 
 # Uncovered-demand penalty. Each uncovered crew slot (a seat on a flight that no
-# crew operates) is charged at DOUBLE the senior-seat cost of that flight, i.e.
-#   penalty(slot on f) = UNCOVERED_MULT * RATE_FLY[senior] * duration_f.
-# A cancelled flight (no senior) contributes its full r_f slots; an understaffed
-# flight contributes its shortfall r_f - (operators).
-UNCOVERED_MULT = 2.0
+# crew operates) is charged a flat big-M, exactly as the solver does, i.e.
+#   penalty(slot on f) = C_UNC,  with C_UNC = 1e8.
+# This is a coverage-forcing device, not a real cost: it sits orders of magnitude
+# above any covering cost so the optimiser never trades a coverable flight for
+# the penalty. A cancelled flight (no senior) contributes its full r_f slots; an
+# understaffed flight contributes its shortfall r_f - (operators).
+C_UNC = 10 ** 8
 
-NORMAL_ID_OFFSET = 10 ** 6   # fallback senior/normal split if is_senior absent
+NORMAL_ID_OFFSET = 10 ** 8   # fallback senior/normal split if is_senior absent
 
 
 def is_senior_map(data):
@@ -100,19 +103,17 @@ def compute_cost(data):
 
     # ── Uncovered-demand penalty ─────────────────────────────────────────────
     # An uncovered slot is a required seat (r_f) with no operating crew. Each is
-    # charged 2x the senior-seat cost of its flight: UNCOVERED_MULT * 420 * duration.
+    # charged a flat big-M C_UNC = 1e8, matching the solver's coverage penalty.
     unc_slots = 0
     unc_penalty = 0.0
-    senior_pen = RATE_FLY[True]
     for f in data.get("flights", []):
         geo = (f.get("origin"), f.get("dest"), f.get("dep_min"))
         rf = f.get("min_crew", 1)
         ops = operators.get(geo, 0)
         short = max(0, rf - ops)
         if short:
-            dur = f.get("duration", f.get("arr_min", 0) - f.get("dep_min", 0))
             unc_slots += short
-            unc_penalty += short * UNCOVERED_MULT * senior_pen * dur
+            unc_penalty += short * C_UNC
 
     return {
         "senior": senior,
@@ -158,7 +159,7 @@ def report(data, res):
     pen = res["unc_penalty"]
     print(f"  crew labour cost        : ${labour:>18,.2f}")
     print(f"  uncovered penalty       : ${pen:>18,.2f}"
-          f"   ({res['unc_slots']} slots @ {UNCOVERED_MULT:g}x senior seat)")
+          f"   ({res['unc_slots']} slots @ $1e8 big-M)")
     print("  " + "-" * 56)
     print(f"  GRAND TOTAL             : ${labour + pen:>18,.2f}")
     return labour + pen

@@ -6,7 +6,6 @@ talk/talk.mov
 *.pkl
 *.pyc
 /flight-solver-visualizer
-/results
 /.claude
 
 # archived / superseded code and duplicate drafts
