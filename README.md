@@ -36,6 +36,7 @@ report/  ·  talk_final/             (Typst write-up and slides)
 | `crew_two_layer.py` | **Orchestrator** for multi-crew flights. Layer 1 places one senior per flight (`min_crew = 1`); flights with no senior are cancelled. Layer 2 fills the remaining `min_crew − 1` seats with normal crew. Idle seniors can substitute into normal seats. |
 | `data/faa_tail_lookup.py` | Enriches raw BTS flight data with aircraft type and seat count (FAA Aircraft Registry), then maps seats → minimum cabin crew via 14 CFR 121.391 (`ceil(seats / 50)`). |
 | `results/validate_availability.py` | Independent validator: reconstructs each crew's physical timeline from the result JSON and flags continuity, overlap, turnaround, away-cap (`d_away`) and consecutive-duty (`duty_block`) violations. |
+| `compute_cost.py` | Costs a two-layer result under a senior/normal per-minute labour-rate model (flying, deadhead, waiting) plus an uncovered-slot penalty. Rates are constants at the top of the file. |
 | `flight-solver-visualizer/` | SvelteKit + deck.gl visualizer (its own README). Loads a result JSON and shows, at any instant, airborne flights, crew positions, and active breaks. |
 | `report/` , `talk_final/` | Typst thesis (`report/draft.typ`) and presentation. |
 | `archive/` | Superseded solver versions and abandoned approaches (CP, column generation, DIDP, earlier DDD/flow iterations). Git-ignored; kept locally for reference. |
@@ -76,7 +77,29 @@ python3 data/faa_tail_lookup.py --input data/T_ONTIME_MARKETING.csv \
 python3 crew_two_layer.py data/flights_enriched.csv 30 G7
 ```
 
+The two instances analysed in the report (see [Notes](#notes)) are produced by:
+
+```sh
+# G7 — real enriched data, uniform 2 crew per flight (real-data case)
+python3 crew_two_layer.py data/flights_enriched.csv 30 G7
+
+# ZW — random heterogeneous demand, min_crew ∈ [1,8] (mixed-demand case)
+python3 crew_two_layer.py data/flights_2025-01-random.csv 30 ZW
+```
+
 Running without the airline argument prints the carriers in the file and prompts for one.
+Each two-layer run also caches its per-layer results as `results/result_<AIRLINE>_L1senior.json`
+and `..._L2normal.json`.
+
+**2b. Re-combine from cached layers** (no re-solve): rebuild the merged
+`result_<AIRLINE>_twolayer.json` from the cached layer files — useful after a fix to the
+combine step. The `<csv>` and `<days>` must match the original run so the flight geometry
+lines up (a mismatch trips a loud guard rather than silently producing a bad file):
+
+```sh
+# args: recombine <csv> <planning days> <airline> [suffix]
+python3 crew_two_layer.py recombine data/flights_2025-01-random.csv 30 ZW
+```
 
 **3. Solve the single-commodity model directly** (treats each flight's `min_crew` as-is):
 
@@ -90,7 +113,17 @@ python3 crew_solver.py data/flights_enriched.csv 30 G7
 python3 results/validate_availability.py results/result_G7_twolayer.json
 ```
 
-**5. Visualize:**
+**5. Cost a result** under a senior/normal labour-rate model:
+
+```sh
+python3 compute_cost.py results/result_ZW_twolayer.json
+```
+
+Reports flying / deadhead / waiting cost split by senior vs normal, plus an uncovered-slot
+penalty. Rates (senior 420 $/min fly, normal 100; waiting 1.0 / 0.5; uncovered slots at
+2× the senior-seat cost) are constants at the top of the script.
+
+**6. Visualize:**
 
 ```sh
 cd flight-solver-visualizer && bun install && bun run dev

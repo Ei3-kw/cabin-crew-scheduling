@@ -1692,11 +1692,6 @@ class CrewNetwork:
         crew_depot   = Node(self.crew_start_airport[crew_id], self.depot_start)
         home_horizon = Node(c.base, self.horizon_end)
 
-        # NOTE: the old code had an extra branch:
-        #   elif node.time == DEPOT_START and node.airport != c.base:
-        #       constr = self.model.addConstr(out_expr == 0)
-        # This was WRONG and is removed. The crew_depot source and home_horizon sink
-        # are the only special nodes; everything else is plain flow conservation.
         if node == crew_depot:
             constr = self.model.addConstr(out_expr - in_expr == 1,
                                           name=f"fb_depot_{crew_id}")

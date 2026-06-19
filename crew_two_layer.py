@@ -98,6 +98,45 @@ def solve_two_layer(csv_path, days, airline):
                        n_cancelled, timings=timings)
 
 
+def recombine(csv_path, days, airline, suffix=""):
+    """Re-run ONLY the combine step from cached layer results -- no re-solve.
+
+    Reads results/result_{airline}_L1senior{suffix}.json and ...L2normal{suffix}.json,
+    re-derives the (deterministic, seeded) senior/normal pools from the flight schedule,
+    and writes results/result_{airline}_twolayer{suffix}.json. Used to regenerate combined
+    files after a combine-step fix (e.g. the _flights_with_real_min_crew geometry-key fix)
+    without paying for the layer MIPs again. The csv/days must match the original run so the
+    flight geometry -- and hence the restored min_crew -- lines up; a mismatch trips the loud
+    guard in _flights_with_real_min_crew."""
+    fba, _ = solver.parse_flights_by_airline(csv_path, days)
+    if airline not in fba:
+        sys.exit(f"airline {airline} not found; have {sorted(fba)[:10]}...")
+    flights = fba[airline]
+
+    l1_path = f"{OUT_DIR}/result_{airline}_L1senior{suffix}.json"
+    l2_path = f"{OUT_DIR}/result_{airline}_L2normal{suffix}.json"
+    for p in (l1_path, l2_path):
+        if not os.path.exists(p):
+            sys.exit(f"missing cached layer file: {p}")
+    L1 = json.load(open(l1_path))
+    L2 = json.load(open(l2_path))
+
+    seniors = solver.size_crew_bases([replace(f, min_crew=1) for f in flights])
+    cancelled_keys = {_fkey(u) for u in L1["uncovered_flights"]}
+    surviving = [f for f in flights if _flight_obj_key(f) not in cancelled_keys]
+    n_cancelled = len(flights) - len(surviving)
+    flights_L2 = [replace(f, min_crew=f.min_crew - 1)
+                  for f in surviving if f.min_crew > 1]
+    normals = ([replace(c, id=c.id + NORMAL_ID_OFFSET)
+                for c in solver.size_crew_bases(flights_L2)] if flights_L2 else [])
+
+    out_path = f"{OUT_DIR}/result_{airline}_twolayer{suffix}.json"
+    print(f"RECOMBINE {airline}{suffix}: {len(seniors)} seniors, {len(normals)} normals "
+          f"from {l1_path} + {l2_path}")
+    combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
+                       n_cancelled, out_path=out_path)
+
+
 DELTA_REST = 8 * 60     # 8h rest
 DELTA_TA   = 45         # 45-min turnaround
 DELTA_HB   = 48 * 60    # 48h home break
@@ -271,12 +310,23 @@ def _flights_with_real_min_crew(l1_flights, flights):
                     "dest": f.dest, "dep_min": f.dep_min}): f.min_crew
             for f in flights}
     out = []
+    n_matched = 0
     for ff in l1_flights:
         ff = dict(ff)
         k = _fkey(ff)
         if k in real:
             ff["min_crew"] = real[k]
+            n_matched += 1
         out.append(ff)
+    # Fail loud: if (almost) nothing matched, the restore silently fell through and every
+    # flight keeps min_crew=1 -- the corruption that made normals show zero flying time.
+    if l1_flights and n_matched < len(l1_flights):
+        msg = (f"  _flights_with_real_min_crew: matched {n_matched}/{len(l1_flights)} "
+               f"flights to a real min_crew by geometry key")
+        if n_matched == 0:
+            raise RuntimeError(msg + " -- combined min_crew would be all 1 (corrupt). "
+                               "Are `flights` the ORIGINAL Flight objects for this airline?")
+        print(msg + " (unmatched flights keep min_crew=1)")
     return out
 
 
@@ -309,7 +359,7 @@ def _cap_overstaffing(routes, combined_flights, senior_ids):
 
 
 def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
-                       n_cancelled, timings=None):
+                       n_cancelled, timings=None, out_path=None):
     import time as _t
     t_combine = _t.time()
     # working crew per flight: 1 senior (if surviving) + normals from L2
@@ -417,7 +467,7 @@ def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
         "routes": _merged_routes,
         "uncovered_flights": L1.get("uncovered_flights", []),   # cancelled flights
     }
-    out = f"{OUT_DIR}/result_{airline}_twolayer.json"
+    out = out_path or f"{OUT_DIR}/result_{airline}_twolayer.json"
     json.dump(combined, open(out, "w"), indent=2)
     print(f"\n  Combined → {out}")
 
@@ -425,6 +475,17 @@ def combine_and_report(airline, flights, seniors, normals, L1, L2, surviving,
 if __name__ == "__main__":
     import csv as _csv
     from collections import Counter as _Counter
+
+    # `recombine` subcommand: re-run only the combine step from cached layers (no solve).
+    #   python3 crew_two_layer.py recombine <csv> <days> <airline> [suffix]
+    if len(sys.argv) > 1 and sys.argv[1] == "recombine":
+        rc_csv  = sys.argv[2] if len(sys.argv) > 2 else "data/flights_enriched.csv"
+        rc_days = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+        rc_air  = sys.argv[4] if len(sys.argv) > 4 else sys.exit(
+            "usage: crew_two_layer.py recombine <csv> <days> <airline> [suffix]")
+        rc_suf  = sys.argv[5] if len(sys.argv) > 5 else ""
+        recombine(rc_csv, rc_days, rc_air, rc_suf)
+        sys.exit(0)
 
     path = sys.argv[1] if len(sys.argv) > 1 else "data/flights_enriched.csv"
     # days = length of the coverage period; default 30 so the rolling horizon runs ALL

@@ -10,14 +10,18 @@
 )
 
 = Introduction
+
+When I was a kid I thought flight attendants had the best job in the world. They flew for free, they got to walk around the plane while everyone else sat strapped in, they had a whole galley of food within arm's reach, and they were paid to travel everywhere. It looked like someone had taken the fun parts of a holiday and handed them over as a salary.
+
+What I never once thought about was how any of them ended up on a particular flight. I only started wondering after watching a video on how airlines actually schedule their crew — the bidding, the trip assignments, the rules stacked on top of rules — and coming away thinking the whole thing looked kind of broken for something so important. Underneath that mess is a real and surprisingly hard optimization problem, and that is what pulled me into this report.
+
 == Background Problem
 
-Crew is an airline's second-largest operating cost, behind only fuel, so how flights are staffed has a real effect on profitability. The cabin-crew pairing problem asks for a set of legal duty sequences, or _pairings_, that each begin and end at a crew member's home base, respect working-time rules, and together cover every scheduled flight at minimum cost. Cabin crew are harder to schedule than cockpit crew because they are heterogeneous. They are cross-qualified across aircraft types and split into classes, and how many of each class a flight needs depends on the aircraft's size and cabin layout. A regional turboprop might need a single attendant, while a widebody needs eight.
+Crew is an airline's second-largest operating cost, behind only fuel, so how flights are staffed has a real effect on profitability. The cabin-crew pairing problem asks for a set of legal duty sequences, or _pairings_, that each begin and end at a crew member's home base, respect working-time rules, and together cover every scheduled flight at minimum cost. Cabin crew are harder to schedule than cockpit crew because they are heterogeneous: they are cross-qualified across aircraft types and split into classes, and how many of each class a flight needs depends on the aircraft's size and cabin layout. A regional turboprop might need a single attendant, while a widebody needs eight.
 
 We model this in a deliberately simple form. Each flight needs between one and eight crew. Exactly one must be a _senior_, the rest can be anyone. A senior can fill any seat, but a normal can never fill the senior's. The senior is therefore the scarce, binding resource: it decides whether a flight can be staffed at all.
 
 A pairing is legal only if it respects the operational clocks the model tracks. Two consecutive flights need at least a 45-minute turnaround between them. A duty period can build up at most 14 hours of block time before an 8-hour rest clears it. And a crew member can stay away from base for at most 4 days before owing a 48-hour home break.
-
 
 Unlike formulations that plan around a single base and import "extra" crew at a flat penalty, we model the real geography: crew are based at many airports, can only originate and terminate duties at their own base, and must be physically positioned, by flying or deadheading, to wherever a flight departs. Coverage is thus limited not just by how many crew exist, but by whether the right class can legally reach the right place at the right time. That is the central tension the rest of this report addresses.
 
@@ -78,17 +82,6 @@ Pass one stamps every flight with demand one and solves over a dedicated senior 
 
 Pass two takes those surviving flights, re-stamps each with demand $r_f - 1$, and solves over a separate normal pool. Flights with $r_f = 1$ are already complete and carry no demand here; $r_f = 2$ stays unit-demand, higher values give small multiplicity. Normal identifiers are offset so they never collide with senior ones on merge.
 
-=== Senior Substitution in Idle Gaps
-
-After both passes, some surviving flights are still short a normal. A senior can fill a normal seat, but only opportunistically: inside an idle gap of its own layer-1 route, never displacing a senior duty. This is a greedy post-processing pass, not part of either MIP. It fills one seat per gap and writes each accepted fill back as a real flight leg on the senior's route, so the schedule, visualiser and validator all reflect it.
-
-An idle gap runs from a senior's arrival at an airport up to its next senior departure, or to the end of its route. A candidate fill flight $f$ must clear two gates.
-
-==== Geometric Feasibility
-The senior must be parked at $f$'s origin $"orig"_f$, rested across the gap (the 8-hour minimum, so $"dep"_f - "arr"_"prev" >= 480$ minutes), and, when a senior duty follows the gap, able to connect to it: $f$ must land where that duty departs ($"dest"_f = "orig"_"next"$), leaving the 45-minute turnaround, $"arr"_f + 45 <= "dep"_"next"$. A gap with no following duty clears this trivially.
-
-==== Route Legality
-This is what the gate geometry alone misses: a senior parked far from base could satisfy the geometry yet break the away cap by flying a fill hours or days later. So we insert $f$ into the senior's route, re-sort by departure, and re-check the whole route against the same rules the model enforces. No leg may depart more than 4 days after the senior last left home with no 48-hour break in between, and no run of consecutive duty days may exceed 3 days. The check is cumulative, so several fills on one senior stay jointly legal. A gap failing either gate yields nothing, which makes the pass best-effort: it recovers a handful of understaffed flights and leaves the rest short.
 
 == Crew Base Allocation
 
@@ -173,7 +166,7 @@ defrow($l_("hi") = 0.90$, [Load factor above which opp-cost is full fare]),
   defrow($Delta_(d u t y) = 14$, [Maximum on-duty time (h) between 8h breaks]),
   defrow($Delta_(h b) = 48$,    [Minimum home break (h)]),
   defrow($Delta_(o v) = 4$, [Overnight threshold (h): a wait $>= Delta_(o v)$ triggers $c_(o v)$]),
-  defrow($d_(w o r k) = 3$,    [Max consecutive duty days]),
+  defrow($d_(w o r k) = 3$,    [Consecutive-duty-day bound — a graph-pruning aid, not an enforced limit]),
   defrow($d_(a w a y) = 4$,        [Maximum number of days without a home break]),
   defrow($T_(d a y s) = 7$,    [Solve window length (days)]),
   defrow($T_(c o m m i t) = 3$,[Committed per step (days)]),
@@ -210,22 +203,28 @@ received a senior in layer $1$.
   defrow($u_f in {0, ..., m_f}$,     [Uncovered slack on leg $f in F_w union F_(w')$]),
 ))
 
-== Rolling horizon
 
-  The horizon $D$ is swept by the ordered windows $W$. Window $w$ runs
-  $ t_w^"start" = w thin T_(c o m m i t) dot 1440, quad
-    t_w^"commit" = t_w^"start" + T_(c o m m i t) dot 1440, quad
-    t_w^"hor" = t_w^"start" + (T_(d a y s) + T_(t a i l)) dot 1440 $
-  and its legs split by departure into
-  $ tilde(F)_w &= {f in F : t_w^"start" <= "dep"_f < t_w^"hor"}, \
-    F_w &= {f in tilde(F)_w : "dep"_f < t_w^"commit"}, \
-    F_(w') &= {f in tilde(F)_w : t_w^"commit" <= "dep"_f < t_w^"commit" + 1440 T_("look")} $
+== Rolling Horizon
 
-  Each $w in W$ is solved as the single-window model below, in order. Only $F_w$ is committed (frozen and written out); legs after $t_w^"commit"$ are re-solved by later windows. Carry-over seeds the next depot: for crew $c$, the state $"src"_g$ in window $w + 1$ inherits the airport and the duty / away / break clocks $c$ holds at $t_(w+1)^"start"$ under window $w$'s committed route. This hand-off is the only link between windows — there is no constraint coupling them; $w + 1$'s depot is pinned to where $w$'s frozen route left each crew, so the boundaries match by construction.
+The horizon $D$ is swept by the ordered windows $W$. Window $w$ runs
+$ t_w^"start" = w thin T_(c o m m i t) dot 1440, quad
+  t_w^"commit" = t_w^"start" + T_(c o m m i t) dot 1440, quad
+  t_w^"hor" = t_w^"start" + (T_(d a y s) + T_(t a i l)) dot 1440 $
+and its legs split by departure into
+$ tilde(F)_w &= {f in F : t_w^"start" <= "dep"_f < t_w^"hor"}, \
+  F_w &= {f in tilde(F)_w : "dep"_f < t_w^"commit"}, \
+  F_(w') &= {f in tilde(F)_w : t_w^"commit" <= "dep"_f < t_w^"commit" + 1440 T_("look")} $
 
-  Two boundary terms close the seam. $T_(t a i l) = d_(a w a y)$ leaves room to route every committed crew home within the away cap, and the soft set $F_(w')$ pulls crew into position for the next window's first bank.
+Each $w in W$ is solved as the single-window model below, in order. Only $F_w$ is committed (frozen and written out); legs after $t_w^"commit"$ are re-solved by later windows.
 
-  The seam exists because of where coverage fails. In a trial run on ZW, $14$ of $20$ uncovered legs fell in the first $8$ h of a window: a leg leaving a spoke early on day $t_w^"start"$ can only be worked by a crew already rested there, but the deadhead that positions them must depart the evening before — inside the previous window, which no longer sees the leg as its responsibility and so never pre-positions. Marking these legs as $F_(w')$ gives that previous window a reason to commit the positioning deadhead in its own commit region, so the next window inherits a rested crew and covers the leg for real. The penalty is deliberately soft, $c_(u n c') = 10^6$: above the positioning cost (deadhead $+$ wait $+$ leg, $tilde.eq 1.5 times 10^4$) so the solver does pre-position, but far below $c_(u n c) = 10^8$ so it never sacrifices a committed cover to chase a seam one. Seam legs are re-solved by the next window, so they never count as uncovered here.
+=== Seaming
+Two boundary terms close the seam. $T_(t a i l) = d_(a w a y)$ leaves room to route every committed crew home within the away cap, and the soft set $F_(w')$ pulls crew into position for the next window's first bank.
+
+The seam exists because of where coverage fails. In a trial run on ZW, $14$ of $20$ uncovered legs fell in the first $8$ h of a window: a leg leaving a spoke early on day $t_w^"start"$ can only be worked by a crew already rested there, but the deadhead that positions them must depart the evening before — inside the previous window, which no longer sees the leg as its responsibility and so never pre-positions. Marking these legs as $F_(w')$ gives that previous window a reason to commit the positioning deadhead in its own commit region, so the next window inherits a rested crew and covers the leg for real. The penalty is deliberately soft, $c_(u n c') = 10^6$: above the positioning cost (deadhead $+$ wait $+$ leg, $tilde.eq 1.5 times 10^4$) so the solver does pre-position, but far below $c_(u n c) = 10^8$ so it never sacrifices a committed cover to chase a seam one. Seam legs are re-solved by the next window, so they never count as uncovered here.
+
+=== Window Carry-over
+At each seam the next window starts from the committed state of the previous one — the only link between windows; there is no constraint coupling them, so window $w + 1$'s depot is pinned to where $w$'s frozen route left each crew, and the boundaries match by construction. Two things carry across: each crew's committed end position — the airport it occupies when the committed region closes — and its break-clock state, summarised by a single anchor, the minute the crew last left home after a completed home break, from which the away budget keeps counting. The subtlety is what counts as a completed break: only a 48-hour home stay whose full 48 hours elapse inside the committed region advances the anchor. A break the solver schedules in the uncommitted tail is deliberately not credited, because the tail is re-planned by the next window and that break may never actually be flown. A crew that is home at the seam but has served only part of its break carries the start of that home stay forward, so the next window finishes the remaining hours rather than restarting a fresh 48 — this neither forces an early return nor grants a free reset.
+
 
 == Network Construction
 
@@ -252,9 +251,9 @@ construction, so the optimisation itself carries no rows for them.
 
 + *Reachability pruning.* For all crew $c$ with depot $o_c$ and home base $b_c$,
   $ cal(A)_c = { a in cal(A)_w : "both ends of" a in "Fwd"(o_c) inter "Bwd"(b_c, t_w^"hor") }, $
-  the forward/backward Dijkstra reachable sets, with any arc breaching $d_(w o r k)$ or $d_(a w a y)$ dropped mid-sweep.
+  the forward/backward Dijkstra reachable sets, dropping mid-sweep any arc that breaches the away cap $d_(a w a y)$. The sweep also cuts runs past $d_(w o r k)$ consecutive duty days — not a rule but a size bound (see Structural Constraints).
 
-+ *Break-clock expansion.* Lift every reachable $(p, t)$ to states $(p, t, e)$, $e$ the latest minute the next $>= Delta_(h b)$ home break may finish. For all home stays $>= 60 Delta_(h b)$ a free reset arc re-anchors $e <- "floor"_"day"(t' + 1440 d_(a w a y) + 60 Delta_(h b))$; any non-reset arc is admitted iff its head time $<= e$. All states $(p, t_w^"hor", dot)$ collapse to one sink.
++ *Break-clock expansion.* Lift every reachable $(p, t)$ to states $(p, t, e)$, $e$ the latest minute the next $>= Delta_(h b)$ home break may finish. For all home stays $>= 60 Delta_(h b)$ a free reset arc re-anchors $e <- "floor"_"day"(t' + 1440 d_(a w a y) + 60 Delta_(h b))$; any non-reset arc is admitted iff its head time $<= e$. All states $(p, t_w^"hor", dot)$ collapse to one sink. Bucketing $e$ to whole days ($"floor"_"day"$) is what keeps the state space finite: states share an expiry whenever their deadlines fall on the same day, so $e$ takes only a handful of values rather than a distinct minute-resolution clock per crew, and rounding down never overstates a deadline, so no illegal route slips through.
 
 + *Clock-group aggregation.* Crew with an identical expanded graph form a group $g in cal(G)_w$, $K_g = |g|$; the model carries one flow $x_(g,a)$ for all $g in cal(G)_w, thick a in cal(A)_g$.
 
@@ -265,11 +264,12 @@ The model carries only flow-balance and coverage rows; every other rule is baked
   defrow($Delta_(t a)$, [Turnaround — flight arcs land on the snapped node $"arr"_f + Delta_(t a)$]),
   defrow($Delta_(d u t y)$, [Duty cap — flight arcs whose cumulative duty exceeds $60 Delta_(d u t y)$ are dropped]),
   defrow($Delta_(r e s t)$, [Rest — a wait arc of $>= 60 Delta_(r e s t)$ zeroes the duty clock]),
-  defrow($d_(w o r k)$, [Consecutive duty days — pruned in the reachability Dijkstra]),
   defrow($d_(a w a y), Delta_(h b)$, [Away cap and home break — carried by each state node's expiry $e$, reset only by a $>= Delta_(h b)$ home stay]),
 ))
 
 The LP is thus small and integral — conservation plus unit-coefficient coverage, with all legality in the arcs. Conservation also hands each crew a single trajectory: it leaves every state on exactly one arc and time strictly advances, so no crew is booked on two legs — or a leg and a wait — at once. One thing at a time is structural, not a row.
+
+$d_(w o r k) = 3$ is not enforced as a rule. The reachability sweep drops runs of more than three consecutive duty days purely to shrink the graph: once the overnight rests between duty days are counted, such a run almost always already breaches the $d_(a w a y)$ away cap, so cutting it early discards essentially no legal route. The only place it actually binds is the greedy senior-substitution gate, which re-checks it explicitly.
 
 == Objective
 
@@ -288,7 +288,7 @@ with the per-arc cost, for a group based at $b$,
 
 $ c_a = cases(
   c_(f l,ell) thin delta_f & "if " a in cal(A)^"fl" "of leg " f,
-  c_(d h,f) (1 - rho bb(1)["dest"_f = b]) quad & "if " a in cal(A)^"dh" "of leg " f,
+  c_(d h,f) (1 - rho bb(1)["dest"_f = b]) quad quad & "if " a in cal(A)^"dh" "of leg " f,
   c_(w t,ell) thin Delta t_a + c_(o v) bb(1)[Delta t_a >= 60 Delta_(o v)] & "if " a in cal(A)^"wt" "away from base",
   0 & "if " a "a home-wait or break-reset arc."
 ) $
@@ -300,16 +300,16 @@ $ c_a = cases(
 
 $ sum_(a in delta^+(n)) x_(g,a) - sum_(a in delta^-(n)) x_(g,a)
   = cases(K_g & "if " n = "src"_g, -K_g & "if " n = "snk"_g, 0 & "otherwise")
-  #h(1fr) forall g in cal(G)_w, thin n in cal(N)_g $
+  #h(1fr) quad forall g in cal(G)_w, thin n in cal(N)_g $
 
 $ sum_(g in cal(G)_w) sum_(a in cal(A)_(g,f)^"fl") x_(g,a) + u_f >= m_f
-  #h(1fr) forall f in F_w union F_(w') $
+  #h(1fr) quad forall f in F_w union F_(w') $
 
 $ 0 <= x_(g,a) <= K_g
-  #h(1fr) forall g in cal(G)_w, thin a in cal(A)_g $
+  #h(1fr) quad forall g in cal(G)_w, thin a in cal(A)_g $
 
 $ 0 <= u_f <= m_f
-  #h(1fr) forall f in F_w union F_(w') $
+  #h(1fr) quad forall f in F_w union F_(w') $
 ]
 
 - (1) Conserves crew flow: $K_g$ crew leave each group's depot state, $K_g$ are absorbed at its horizon sink, and in- and out-flow balance at every other state.
@@ -317,74 +317,245 @@ $ 0 <= u_f <= m_f
 - (3) Bounds a group's flow on any arc by the group size $K_g$.
 - (4) Bounds a leg's shortfall by its demand $m_f$.
 
-Turnaround $Delta_(t a)$, the duty cap $Delta_(d u t y)$, rest $Delta_(r e s t)$, the
-$d_(w o r k)$ and $d_(a w a y)$ caps, and the $Delta_(h b)$ home break are not rows
-here — they are enforced by the construction of $cal(N)_w$ and $cal(A)_g$.
 
 
-=== Rolling Horizon
-==== Seaming
-==== Window Carry-over
+== Solve Method
+=== Recovering Schedules by Flow Decomposition
+// A clock-group collects crew that are not merely at the same place but in the same legal situation, so that any continuation feasible for one is feasible for all. At the start of window $w$ each crew $c$ is keyed by the tuple
 
-At each seam the next window starts from the committed state of the previous one. Two things carry across: each crew's committed end position -- the airport it occupies when the committed region closes -- and its break-clock state. The clock is summarised by a single anchor, the minute the crew last left home after a completed home break, from which the away budget keeps counting. The subtlety is what counts as a completed break: only a 48-hour home stay whose full 48 hours elapse inside the committed region advances the anchor. A break the solver schedules in the uncommitted tail is deliberately not credited, because the tail is re-planned by the next window and that break may never actually be flown. A crew that is home at the seam but has served only part of its break carries the start of that home stay forward, so the next window finishes the remaining hours rather than restarting a fresh 48 -- this neither forces an early return nor grants a free reset.
+// $ (b, thick o_c, thick d^0_c, thick alpha_c, thick e^0_c, thick h_c), $
 
-==== Break-Clock Expansion
-// clock state (away budget / home break) is a node dimension; an illegal transition
-// simply has no arc, so any path through the graph is rule-legal by construction
-==== Clock-Group Aggregation
-// crew sharing (base, start airport, carry-over clock) have a byte-identical expanded
-// graph and are interchangeable; min_crew = 1 makes them unit-demand
-==== Integer Group Flow
-// one integer flow var per (clock-group, arc) instead of one binary per (crew, arc);
-// flow value = how many crew of that group traverse the arc
+// its home base $b$, its start airport $o_c$ (where carry-over left it), the consecutive duty days $d^0_c$ carried in, the away anchor $alpha_c$ — the minute $c$ last left home after a completed $48$-h break, the point its $d_(a w a y)$ budget counts from — the break deadline $e^0_c$ (the initial value of the expiry coordinate $e$ at the depot state, the latest minute its next $>= Delta_(h b)$ break may finish), and a partial-break credit $h_c$ recording the start of an in-progress home stay. Crew sharing this tuple expand to a byte-identical state graph — same depot, same sink, same admissible arcs, same reset points — so they are interchangeable, and the model carries one integer flow $x_(g,a)$ with $K_g = |g|$ instead of a variable per crew.
 
-==== Recovering Schedules by Flow Decomposition
-===== Acyclic Graph gives a Clean Path Split
-// the time-expanded graph is a DAG, so the integer flow has no cycles and splits into
-// exactly K simple depot→sink paths for a group of K crew
-===== Coverage is Preserved
-// coverage is a constraint ON the flow (Σ flight-arc flow + slack ≥ r_f); decomposition
-// conserves the per-arc count exactly, so each flight is operated by the same number of crew
-===== Break Requirements are Preserved
-// every decomposed path lies in the expanded graph, so home break / away cap / 8h rest /
-// 45-min turnaround / 14h duty all hold by construction — not re-checked afterward
-===== Connectivity from Flow Conservation
-// conservation makes each unit a connected depot→sink walk; node time-ordering makes it
-// a valid chronological route. Cross-window continuity is handled by carry-over
-===== Interchangeability and Arbitrary Assignment
-// paths are assigned to crew-ids in any order within a group (feasible but not canonical);
-// optional tie-break for balance
-=== Object Function
-==== Uncovered-Slot Penalty
-=== Constraints
-==== Coverage
-==== Turnaround (45 min)
-==== Duty Limit (14h block time since last rest)
-==== Overnight Rest (8h)
-==== Home Break (48h) and Away Cap (4 days)
-=== Solve Method
-==== Barrier vs Simplex
+// The clock fields are what make the pooling exact rather than approximate. Two crew at the same airport are not in the same group if their away clocks differ: a crew three days into its away spell and one a single day out have different remaining budgets and different break deadlines, so a leg legal for the second could strand the first past $d_(a w a y)$ — they fall in separate groups. The partial-break credit $h_c$ likewise keeps a crew that is mid-break at the seam distinct, so its group finishes the remaining hours rather than restarting a fresh $48$.
 
-The per-window relaxation is large and sparse, so it is solved by the barrier (interior-point) method rather than simplex, which otherwise spent the whole time limit pivoting at the root. For the unit-demand models -- the senior layer, or any single-crew airline -- the group-flow relaxation is integral, so the barrier lands directly on an integer optimum, branch-and-bound never fires, and crossover to a simplex basis is pure overhead and is switched off. This is the regime the method is built for, and such windows solve in well under a minute. Once a flight needs more than one crew the coverage constraints couple flow across groups and break that integrality, so the root relaxation is fractional and the model must branch, with the consequences taken up in the results.
+// In the first window every crew sits at home on a fresh clock, so each base contributes a single group; groups multiply only as later windows scatter crew across positions and clock states. Reachability is cached one level coarser — on $(b, o_c, d^0_c, alpha_c)$ but not the break deadline — because the forward/backward Dijkstra does not depend on the deadline, only the break-clock expansion does.
 
-==== Deterministic Model Construction
+
+The solver returns an integer flow $x_(g,a)$ per group and arc, not crew routes — it is the aggregation of @fig-groups run in reverse. Each group's expanded graph is acyclic, so its $K_g$ units of flow carry no cycles and split into $K_g$ simple paths, one per crew. Each path runs from the depot state $"src"_g$ to the home-base sink $"snk"_g$, conserving at every state in between, and node time-ordering makes it a valid chronological route — the endpoints are pinned to a base, the middle is free state-to-state travel.
+
+#figure(
+  image("img/clock_group_aggregation.svg"),
+  caption: [Crew with an identical carry-state signature collapse into one clock-group, decomposition reverses the arrows.],
+) <fig-groups>
+
+The split preserves everything the model enforced. Coverage is a constraint on the per-arc flow ($sum$ flight-arc flow $+ thin u_f >= m_f$), and decomposition keeps each arc's count exact, so every leg keeps its crew. Each path lies inside the expanded graph, so turnaround, duty, rest, the away cap, and the home break already hold — nothing is re-checked. Because a group's crew are interchangeable, the paths attach to crew-ids in any order (an optional tie-break balances duty hours or holds ids steady across windows); seam continuity comes from carry-over.
+
+=== Senior Substitution in Idle Gaps
+
+// After both passes, some surviving flights are still short a normal. A senior can fill a normal seat, but only opportunistically: inside an idle gap of its own layer-1 route, never displacing a senior duty. This is a greedy post-processing pass, not part of either MIP. It fills one seat per gap and writes each accepted fill back as a real flight leg on the senior's route, so the schedule, visualiser and validator all reflect it.
+
+// An idle gap runs from a senior's arrival at an airport up to its next senior departure, or to the end of its route. A candidate fill flight $f$ must clear two gates.
+
+// ==== Geometric Feasibility
+// The senior must be parked at $f$'s origin $"orig"_f$, rested across the gap (the 8-hour minimum, so $"dep"_f - "arr"_"prev" >= 480$ minutes), and, when a senior duty follows the gap, able to connect to it: $f$ must land where that duty departs ($"dest"_f = "orig"_"next"$), leaving the 45-minute turnaround, $"arr"_f + 45 <= "dep"_"next"$. A gap with no following duty clears this trivially.
+
+// ==== Route Legality
+// This is what the gate geometry alone misses: a senior parked far from base could satisfy the geometry yet break the away cap by flying a fill hours or days later. So we insert $f$ into the senior's route, re-sort by departure, and re-check the whole route against the same rules the model enforces. No leg may depart more than 4 days after the senior last left home with no 48-hour break in between, and no run of consecutive duty days may exceed 3 days. The check is cumulative, so several fills on one senior stay jointly legal. A gap failing either gate yields nothing, which makes the pass best-effort: it recovers a handful of understaffed flights and leaves the rest short.
+
+After both layers solve and decompose, some surviving flights are still short a normal. A senior can fill a normal seat, but only opportunistically: inside an idle gap of its own senior route ($ell = 1$), never displacing a senior duty. This is a greedy post-processing pass, not part of either MIP — it fills one seat per gap and writes each accepted fill back as a real leg on the senior's route, so the schedule, visualiser, and validator all reflect it.
+
+An idle gap runs from a senior's arrival at an airport up to its next senior departure, or to the end of its route (@fig-sub). A candidate fill flight $f$ must clear two gates.
+
+#figure(
+  image("img/senior_substitution_idle_gap.svg"),
+  caption: [A fill flight slotted into an idle gap],
+) <fig-sub>
+
+==== Geometric Feasibility
+The senior must be parked at $f$'s origin $"orig"_f$, rested across the gap ($"dep"_f - "arr"_"prev" >= 60 Delta_(r e s t)$), and, when a senior duty follows the gap, able to connect to it: $f$ must land where that duty departs ($"dest"_f = "orig"_"next"$), leaving the turnaround $"arr"_f + Delta_(t a) <= "dep"_"next"$. A gap with no following duty clears this trivially.
+
+==== Route Legality
+Geometry alone misses a slower failure: a senior parked far from base could satisfy it yet break the away cap by flying a fill hours or days later. So we insert $f$ into the senior's route, re-sort by departure, and re-check the whole route against the rules the validator applies — no leg departing more than $d_(a w a y)$ days after the senior last left home without a $Delta_(h b)$ break, and no run of consecutive duty days past $d_(w o r k)$. The check is cumulative, so several fills on one senior stay jointly legal. A gap failing either gate yields nothing, which makes the pass best-effort: it recovers a handful of understaffed flights, and leaves the rest short.
+
+=== Barrier vs Simplex
+The per-window relaxation is large and sparse, so it is solved by barrier (interior-point) rather than simplex, which burned the whole limit pivoting at the root. For unit-demand models — the senior layer, or any single-crew airline — the group-flow relaxation is integral, so barrier lands straight on an integer optimum: no branching, and crossover to a simplex basis is pure overhead, so it is switched off. These windows solve in well under a minute.
+
+Once a flight needs more than one crew, coverage couples flow across groups and breaks that integrality, so the relaxation is fractional and the model must branch (the consequences are in the results). Each solve stops at a 1% gap or 30 minutes; unit-demand windows close at a zero gap, so the limit binds only on these branching windows. For them an optional probe — off by default — runs crossover-free for a few seconds and, if still far from optimal, restarts with crossover on and the solver set to favour integer-feasible solutions, giving branch-and-bound a basis it can warm-start from.
+
+=== Deterministic Model Construction
 
 The expanded graph is built by exploring states held in hash sets, whose iteration order depends on the process hash seed. Identical inputs therefore produced models with their variables in different column orders from one run to the next, and because the crew-flow model is highly degenerate -- many interchangeable crew and equivalent paths -- the solver's anti-degeneracy effort swung sharply with that order, the same window taking anywhere from thirty seconds to over a hundred. Sorting arcs and nodes by value before they are handed to the solver makes the constructed model byte-identical across runs -- same fingerprint, same result, same time -- which removes the variance, makes timings comparable, and as a side effect presolves slightly smaller, since the regular ordering is easier to reduce.
 
+Reproducibility rests on one more fixed point: the synthetic crew pool — its per-base counts and the 10% jitter — and the random load factors are all drawn from a single fixed seed, so a given airline and horizon regenerate the identical instance every run.
 
 
-== Results
 
-=== G7
-==== Coverage Breakdown
-===== Fully Crewed
-===== Cancelled (No Senior)
-===== Understaffed (Normal Shortfall)
+= Results
 
-==== Uncovered flights
-===== Structural Spokes (isolated, sub-45 turnaround)
-===== One-Directional Spoke Connectivity
-===== Rolling-Horizon Seam Effects
+== G7
+
+G7 is a small regional (@instance-table): $5141$ flights over the 30-day horizon across $51$ airports and $143$ routes, requirement two — one senior, one normal. It is chosen not for size but because it solves to optimality in every window while still exercising the full two-layer machinery.
+
+=== Coverage breakdown
+Of the $5141$ flights, $5069$ ($98.6%$) are fully crewed, $10$ fly one normal short, and $62$ ($1.2%$) are cancelled for want of a senior. The senior layer covered $5079$ of $5141$ ($98.8%$); the normal fill left $19$ seats short, of which substitution recovered $9$. The schedule is flat and saturated — about $171$ flights a day, fully crewed on almost every bar (@fig-schedule-G7). The residual is concentrated: cancellations show only at the day-$30$ tail ($16$), with spoke days $11$ and $18$ ($6$ each) the only earlier blips; the short bars on days $6$ and $19$ are light-traffic days, not failures.
+
+#figure(
+  image("img/whole_schedule_coverage_by_day_G7.svg", width: 100%),
+  caption: [Flights per day, stacked by crewing outcome.],
+) <fig-schedule-G7>
+
+=== Cancelled flights
+All $62$ cancellations come from layer 1 (no senior); they fall into three bands (@uncovered-table-G7).
+
+#figure(
+  table(
+    columns: (2.3fr, auto, 4.3fr, 2.5fr),
+    align: (left, center, left, left),
+    inset: 6pt,
+    table.header([*Cause*], [*Count*], [*Mechanism*], [*Verdict*]),
+
+    [Structural spoke, sub-45 turnaround (CLT, RDU, GRR, MCI)],
+    [18],
+    [In-and-out connection sits below $Delta_(t a) = 45$, so no crew can self-chain the round-trip, and the airport is too thin to position a second crew. RDU is covered at a 56-min turnaround and uncovered at 41.],
+    [Genuine geometry limit],
+
+    [One-directional connectivity (AVL, SCE, ABE, MHT, …)],
+    [18],
+    [Reachable inbound but no rested crew for the return: EWR→AVL is reachable by 151 crew, AVL→EWR by 4. The away cap strands any crew flown in; 10 have the reverse leg covered.],
+    [Needs a relaxed away cap or a deadhead-home leg],
+
+    [Rolling-horizon tail (hub origins, day $>= 28$)],
+    [26],
+    [Sit in the last window's tail: the return tail $T_(t a i l)$ runs past the flight data and no later window re-solves them. 16 depart on day 30.],
+    [Needs a longer data horizon],
+  ),
+  caption: [The 62 uncovered G7 flights by cause.],
+) <uncovered-table-G7>
+
+None of this is an optimality-gap artifact, and the reason also fixes what _recoverable_ means. Every window solves to optimality over a totally-unimodular network (integral LP, no gap), and each cancellation costs $c_("unc") = 10^8$ — $62 times 10^8 = 6.20 times 10^9$, or $96%$ of G7's $6.48 times 10^9$ objective. At that price the solver positions crew wherever it legally can, positioning being a deadhead arc chosen inside the MIP and far cheaper than $10^8$; so an uncovered flight is never a missed deadhead but one the constraints forbid. The directional band is blocked by the away cap $Delta_("away") = 4$ days — the round-trip to a one-way spoke will not fit it — and the tail runs past the data. Recovering either is a macro change, not better routing: that is all _recoverable_ means here.
+
+The directional band also clusters at window starts (@onedir-window-G7), which looks like a seam effect — but a longer seam barely touches it. Most of these flights already sit inside the current half-day look-ahead, so the previous window saw them and still found no return crew; more reach adds no crew when the bind is the away cap.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto, auto, auto, auto),
+    align: (left, left, center, center, center, center, center, center),
+    inset: 5pt,
+    table.header([*Flight*], [*Route*], [*Day*], [*Time*], [*Win*], [*Frac*], [*Position*], [*In seam?*]),
+    [4493], [RIC→EWR], [1], [09:21], [0], [0.13], [start], [yes],
+    [4453], [DAY→ORD], [7], [10:20], [2], [0.14], [start], [yes],
+    [4522], [SCE→ORD], [10], [06:48], [3], [0.09], [start], [yes],
+    [4614], [PHL→IAD], [13], [06:15], [4], [0.09], [start], [yes],
+    [4166], [ABE→ORD], [16], [06:30], [5], [0.09], [start], [yes],
+    [4446], [EWR→AVL], [18], [10:17], [5], [0.81], [end], [—],
+    [4444], [AVL→EWR], [18], [13:15], [5], [0.85], [end], [—],
+    [4395], [ORD→DAY], [19], [14:40], [6], [0.20], [middle], [no],
+    [4400], [DAY→ORD], [19], [17:40], [6], [0.25], [middle], [no],
+    [4555], [SCE→ORD], [19], [17:45], [6], [0.25], [middle], [no],
+    [4436], [MHT→EWR], [20], [18:09], [6], [0.59], [middle], [no],
+    [4420], [MHT→EWR], [22], [06:00], [7], [0.08], [start], [yes],
+    [4439], [PVD→EWR], [22], [13:01], [7], [0.18], [start], [just past],
+    [4528], [LIT→ORD], [25], [07:30], [8], [0.10], [start], [yes],
+    [4531], [LNK→ORD], [25], [07:45], [8], [0.11], [start], [yes],
+    [4506], [STL→IAD], [25], [08:15], [8], [0.11], [start], [yes],
+    [4521], [ROC→ORD], [25], [13:40], [8], [0.19], [start], [just past],
+    [4436], [MHT→EWR], [25], [17:51], [8], [0.25], [middle], [no],
+  ),
+  caption: [The 18 one-directional flights by window position. _Frac_ is the fraction through the 3-day window; _In seam?_ marks those inside the half-day look-ahead.],
+) <onedir-window-G7>
+
+=== Understaffing and substitution
+A flight that keeps its senior but loses its normal can be filled post-solve by an idle senior already at the origin — something the normal layer cannot do, as seniors are not in its pool (@sub-table-G7). Each fill is co-located, so no deadhead is needed, and they cluster early when the pool is freshest; the $10$ that remain had no co-located senior and no normal the solve could reach.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto, auto, auto),
+    align: (left, left, center, center, center, center, left),
+    inset: 5pt,
+    table.header([*Flight*], [*Route*], [*Day*], [*Time*], [*Senior*], [*Base*], [*Idle at origin*]),
+    [4426], [STL→ORD], [1], [10:35], [\#64], [EWR], [mid-trip],
+    [4449], [BHM→ORD], [1], [07:30], [\#158], [ORD], [mid-trip],
+    [4532], [MEM→ORD], [2], [11:26], [\#174], [ORD], [mid-trip],
+    [4167], [DCA→EWR], [5], [08:00], [\#74], [EWR], [mid-trip],
+    [4175], [ABE→ORD], [1], [17:30], [\#2], [ABE], [at base],
+    [4430], [MLI→ORD], [7], [15:59], [\#144], [MLI], [at base],
+    [4385], [EWR→ILM], [7], [10:50], [\#45], [DCA], [mid-trip],
+    [4431], [ORD→ABE], [7], [18:15], [\#165], [ORD], [at base],
+    [4457], [EWR→DCA], [4], [20:10], [\#59], [EWR], [at base],
+  ),
+  caption: [The 9 senior substitutions.],
+) <sub-table-G7>
+
+The $10$ still short all operate, one seat under (@understaffed-window-G7). The fixes that don't work are the informative part. The seat costs the same $10^8$ as a cancellation (layer 2's $19$ short seats are $1.9 times 10^9$, nearly its whole objective), so the solver would fill any reachable one — it is not under-priced. Nor is it scarcity, with $120$–$190$ normals idle system-wide each time, nor seam reach, since most already sit inside the look-ahead. The rested normals that show at the origin are a merged-timeline illusion: at $10^8$ a seat a truly free crew would have been used, so these are committed in an adjacent window or held by a home-break or away-cap rule — visible globally, absent from the per-window feasible set.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto, auto, auto, auto),
+    align: (left, left, center, center, center, center, center, center),
+    inset: 5pt,
+    table.header([*Flight*], [*Route*], [*Day*], [*Win*], [*Frac*], [*Position*], [*In seam?*], [*Idle @ orig*]),
+    [4450], [ILM→EWR], [13], [4], [0.19], [start], [just past], [3],
+    [4421], [ALB→EWR], [16], [5], [0.08], [start], [yes], [2],
+    [4478], [CVG→EWR], [16], [5], [0.11], [start], [yes], [1],
+    [4502], [LGA→IAD], [19], [6], [0.15], [start], [yes], [1],
+    [4390], [ITH→EWR], [20], [6], [0.57], [middle], [no], [1],
+    [4516], [GSO→EWR], [22], [7], [0.08], [start], [yes], [5],
+    [4405], [GSO→ORD], [22], [7], [0.09], [start], [yes], [6],
+    [4390], [ITH→EWR], [25], [8], [0.24], [middle], [~], [3],
+    [4421], [ALB→EWR], [28], [9], [0.08], [start], [yes], [3],
+    [4584], [IAD→PHL], [30], [9], [0.85], [end], [—], [2],
+  ),
+  caption: [The 10 flights still one normal short, by window position. _Idle @ orig_ counts rested normals at the origin in the merged timeline.],
+) <understaffed-window-G7>
+
+So the bind is the decomposition itself. Like the cancellations, understaffing is a $10^8$ penalty paid because the sub-problem has no assignable crew — but here the crew exists, in a neighbouring window. Recovering it needs a less decomposed solve, wider window overlap or a joint re-solve, plus the horizon extension for the day-$30$ flight: $10$ seats, $0.2%$, short because the crew that could fill them sit in another sub-problem.
+
+From the crew side (@fig-crew-G7), both pools look much the same: only a thin slice is flying at any moment (blue), most crew are resting or on break, and the dominant grey band is crew simply available. Even at the daily peaks roughly half the pool is idle, and usually more. That deep reserve is what makes senior substitution cheap — an idle senior is often already where a normal is missing — and it is the same idle crew the decomposition cannot reach across window boundaries.
+
+#figure(
+  image("img/crew_states_two_layer_G7.svg", width: 100%),
+  caption: [Crew states by layer],
+) <fig-crew-G7>
+
+
+
+== ZW with Random $r_f$
+
+ZW is a random-demand instance: each flight's requirement $r_f$ is drawn across $1$ to $8$ rather than fixed at one. It has $3594$ flights over $30$ days, $182$ seniors and $511$ normals, and solves to optimality in every window. The heavy, variable demand makes understaffing, not cancellation, the dominant residual.
+
+=== Coverage breakdown
+Seat-demand totals $16{,}307$ across the $3594$ flights: one senior seat each and $12{,}713$ normal seats, a mean of $4.5$ crew per flight. The senior layer cancelled $24$ flights ($0.7%$); the normal layer left $510$ of the $12{,}713$ seats short ($96.0%$ filled), of which substitution recovered $33$. By flight, $3400$ ($94.6%$) are fully crewed, $170$ fly under $r_f$, and $24$ are cancelled. The shortfall is not spread evenly: it is negligible through the first half and climbs across the back half to a peak near day $26$ (@fig-schedule-ZW).
+
+#figure(
+  image("img/whole_schedule_coverage_by_day_ZW.svg", width: 100%),
+  caption: [Flights per day, stacked by crewing outcome.],
+) <fig-schedule-ZW>
+
+=== Cancelled flights
+All $24$ cancellations are layer-1 failures (no senior), and every one is an ORD–spoke connection where the senior pool runs too thin. Fifteen are inbound spoke→ORD legs — LIT recurs three times, each needing $8$, with MHK and MKE twice each — four form two complete day-$2$ round trips (ORD↔IND, ORD↔COU) whose routes never get a senior, and five are a day-$30$ tail of ORD→spoke departures whose return runs past the horizon. The normal fill never sees them.
+
+=== Understaffing
+Understaffing is ZW's real residual, and its cause is not the one the build-up suggests. The empty seat is priced at $10^8$, the same as a cancellation — layer 2's $510$ short seats are $5.1 times 10^10$, its entire objective — so the solver fills any seat it can reach. And the pool is far from spent: $350$–$400$ of the $511$ normals sit idle at midday on every day of the month, the worst understaffing days included. So it is neither under-pricing nor a headcount shortage; more crew would sit just as idle.
+
+What concentrates the shortfall is random demand meeting thin geography. The worst-hit flights are high-$r_f$ departures into spokes that cannot cycle the crew back (@deadend-ZW). ORD→OMA needs seven, but the single daily OMA→ORD leg seats one, so six crew flown out would strand and the seats stay empty though dozens of normals idle at ORD; MCI, SPI and LIT repeat the pattern, their return capacity or its timing short of the outbound demand. The idle ORD reserve is real but unusable: positioning crew out to a one-way spoke breaks the away cap on the way home. Because $r_f$ can reach $8$, an unreachable spoke shows up not as one cancelled flight but as a six- or seven-seat shortfall on a flight that still operates.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto, auto),
+    align: (left, left, center, center, center, center),
+    inset: 5pt,
+    table.header([*Flight*], [*Route*], [*Day*], [*Need*], [*Short*], [*Idle @ ORD*]),
+    [6034], [ORD→OMA], [4], [7], [6], [73],
+    [6173], [ORD→MCI], [26], [8], [7], [55],
+    [6045], [ORD→SPI], [26], [8], [7], [55],
+    [6156], [ORD→LIT], [22], [8], [6], [45],
+  ),
+  caption: [Representative understaffed flights: high-demand departures into spokes, with rested normals idle at the origin.],
+) <deadend-ZW>
+
+The back-half build-up is not depletion. Demand is nearly flat — mean normal seat-demand is $413$ a day early and $433$ late — and the pool stays idle throughout, so the rise is the rolling horizon, not exhaustion: as windows hand off, the crew distribution drifts hub-ward, leaving fewer normals pre-positioned at the spokes where late high-demand legs need them, and the per-window partition then widens those spoke shortfalls. The levers follow from the cause — a relaxed away cap or a permitted deadhead-home to let crew reach one-way spokes, wider window overlap to share the idle reserve across boundaries, a longer horizon for the day-$30$ tail — and not more staff, whose only effect would be a larger idle reserve.
+
+The reserve is plain on the crew side (@fig-crew-ZW): the normal pool spends most of the month available, a deep idle band the schedule never draws down — because the seats it cannot fill are unreachable, not unstaffed.
+
+#figure(
+  image("img/crew_states_two_layer_ZW.svg", width: 100%),
+  caption: [Crew states by layer (top: seniors; bottom: normals).],
+) <fig-crew-ZW>
+
+
+
+
 
 ==== Senior as the Binding Resource
 
@@ -415,7 +586,7 @@ An earlier carry-over read each crew's break deadline straight off the last comm
 
 
 
-== Things Attempted but Left Out
+= Things Attempted but Left Out
 
 === Per-crew Binary
 
@@ -430,12 +601,6 @@ Enabling crossover globally, to give branch-and-bound a warm-start basis on the 
 
 === DDD dead loop
 
-// NOT actually dropped — this is the current method. The early version couldn't
-// reconstruct schedules, but flow decomposition solved that. Moved to
-// Formulations → Crew-Flow Model → Flow Decomposition into Crew Schedules.
-// === Group as Integer Flow
-// - It proves there is a possible solutions
-// - However, we cant reconstruct the schedule, which makes it kinda useless for our purpose
 
 === A Separate counter for working days for each time away window
 - It's basically the same thing as timeaway but blows up the model quite a bit
